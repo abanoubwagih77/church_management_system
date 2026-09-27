@@ -1,0 +1,15 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Local database and data backups (prevent production data from leaking to Git)
+backup/
+data/
+data/*.json
+*.db
+*.sqlite

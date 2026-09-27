@@ -1,0 +1,6 @@
+{
+  "name": "نظام إدارة الخدمات الكنسية",
+  "description": "المنظومة السحابية الموحدة لإدارة الكنائس والخدمات وسجلات الخدام وكشوف الحضور الذكية",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

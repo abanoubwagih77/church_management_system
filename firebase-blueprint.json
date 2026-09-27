@@ -1,0 +1,95 @@
+{
+  "entities": {
+    "Church": {
+      "title": "Church",
+      "description": "Registered church tenant profile and subscription information",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "diocese": { "type": "string" },
+        "slug": { "type": "string" },
+        "phone": { "type": "string" },
+        "address": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "suspended"] },
+        "subscription_plan": { "type": "string", "enum": ["basic", "pro", "enterprise"] },
+        "bishop_name": { "type": "string" },
+        "email": { "type": "string" },
+        "verse": { "type": "string" },
+        "logo_url": { "type": "string" },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["id", "name", "diocese", "status"]
+    },
+    "User": {
+      "title": "User",
+      "description": "Church servant or administrator account credentials and permissions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "church_id": { "type": "string" },
+        "username": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "phone": { "type": "string" },
+        "role": { "type": "string", "enum": ["super_admin", "admin", "servant", "scanner"] },
+        "status": { "type": "string", "enum": ["active", "inactive"] },
+        "servant_id": { "type": "string" },
+        "created_at": { "type": "string" }
+      },
+      "required": ["id", "username", "name", "role"]
+    },
+    "Servant": {
+      "title": "Servant",
+      "description": "Servant official profile, national ID, contact and spiritual service assignment details",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "church_id": { "type": "string" },
+        "full_name": { "type": "string" },
+        "national_id": { "type": "string" },
+        "phone": { "type": "string" },
+        "address": { "type": "string" },
+        "qualification": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "inactive", "suspended"] },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" }
+      },
+      "required": ["id", "church_id", "full_name"]
+    },
+    "Attendance": {
+      "title": "Attendance",
+      "description": "Meeting and service attendance log recorded through QR scanner or manual entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "church_id": { "type": "string" },
+        "servant_id": { "type": "string" },
+        "meeting_id": { "type": "string" },
+        "date": { "type": "string" },
+        "status": { "type": "string", "enum": ["present", "absent", "excused", "late"] },
+        "scanned_at": { "type": "string" }
+      },
+      "required": ["id", "church_id", "servant_id", "date", "status"]
+    }
+  },
+  "firestore": {
+    "/churches/{churchId}": {
+      "schema": "Church",
+      "description": "Collection of all registered churches managed by Super Admin and Church Admins"
+    },
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "System user accounts for super admin, church admins, servants, and scanner devices"
+    },
+    "/servants/{servantId}": {
+      "schema": "Servant",
+      "description": "Servant records partitioned by church_id"
+    },
+    "/attendance/{attendanceId}": {
+      "schema": "Attendance",
+      "description": "Attendance logs partitioned by church_id"
+    }
+  }
+}
