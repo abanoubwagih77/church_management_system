@@ -1,9 +1,11 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Default catch-all
+    // Zero-Trust Security Policy:
+    // Deny all direct client read and write operations.
+    // All application data access is authoritatively managed and validated by the backend Express API.
     match /{document=**} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
   }
 }

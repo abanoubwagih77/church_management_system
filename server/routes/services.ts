@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { getDb, saveDatabase, recordDeletedId } from '../db.js';
+import { getDb, createServiceAtomic, updateServiceAtomic, deleteServiceAtomic } from '../db.js';
 import { authenticateJwt, requirePermission, getEffectiveChurchId, getClientIp, AuthenticatedRequest } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { ChurchService } from '../../src/types/index.js';
@@ -51,10 +51,10 @@ servicesRouter.get('/', requirePermission('view_services'), (req: AuthenticatedR
 });
 
 // POST /api/services - Add service
-servicesRouter.post('/', requirePermission('add_service'), (req: AuthenticatedRequest, res: Response) => {
+servicesRouter.post('/', requirePermission('add_service'), async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   const db = getDb();
-  const churchId = getEffectiveChurchId(req);
+  const churchId = user.role === 'super_admin' ? getEffectiveChurchId(req) : user.church_id;
   const { name, name_ar, code, description, meeting_day, meeting_time } = req.body;
 
   if (!name_ar) {
@@ -94,8 +94,13 @@ servicesRouter.post('/', requirePermission('add_service'), (req: AuthenticatedRe
     created_at: new Date().toISOString(),
   };
 
-  db.services.push(newService);
-  saveDatabase();
+  try {
+    await createServiceAtomic(newService);
+  } catch (err: any) {
+    console.error('Failed to create service in Firestore:', err);
+    res.status(500).json({ error: 'فشل حفظ الخدمة في قاعدة البيانات: ' + (err?.message || 'خطأ غير معروف') });
+    return;
+  }
 
   logAudit({
     userId: user.id,
@@ -112,13 +117,19 @@ servicesRouter.post('/', requirePermission('add_service'), (req: AuthenticatedRe
 });
 
 // PUT /api/services/:id - Update service
-servicesRouter.put('/:id', requirePermission('edit_service'), (req: AuthenticatedRequest, res: Response) => {
+servicesRouter.put('/:id', requirePermission('edit_service'), async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   const db = getDb();
   const service = db.services.find((s) => s.id === req.params.id);
 
   if (!service) {
     res.status(404).json({ error: 'الخدمة غير موجودة' });
+    return;
+  }
+
+  // Tenant Isolation: Non-super-admin users can only update services in their own church
+  if (user.role !== 'super_admin' && service.church_id && user.church_id && service.church_id !== user.church_id) {
+    res.status(403).json({ error: 'غير مصرح: لا يمكنك تعديل بيانات خدمة تابعة لكنيسة أخرى' });
     return;
   }
 
@@ -149,36 +160,45 @@ servicesRouter.put('/:id', requirePermission('edit_service'), (req: Authenticate
 
   const before = { ...service };
 
-  service.name = name !== undefined ? name.trim() : service.name;
-  service.name_ar = name_ar !== undefined ? name_ar.trim() : service.name_ar;
-  service.code = code !== undefined ? code.trim().toUpperCase() : service.code;
-  service.description = description !== undefined ? description : service.description;
-  service.meeting_day = meeting_day !== undefined ? meeting_day : service.meeting_day;
-  service.meeting_time = meeting_time !== undefined ? meeting_time : service.meeting_time;
-  if (status) service.status = status;
+  const updatedService: ChurchService = {
+    ...service,
+    name: name !== undefined ? name.trim() : service.name,
+    name_ar: name_ar !== undefined ? name_ar.trim() : service.name_ar,
+    code: code !== undefined ? code.trim().toUpperCase() : service.code,
+    description: description !== undefined ? description : service.description,
+    meeting_day: meeting_day !== undefined ? meeting_day : service.meeting_day,
+    meeting_time: meeting_time !== undefined ? meeting_time : service.meeting_time,
+    status: status || service.status,
+  };
 
-  saveDatabase();
+  try {
+    await updateServiceAtomic(updatedService);
+  } catch (err: any) {
+    console.error('Failed to update service in Firestore:', err);
+    res.status(500).json({ error: 'فشل تحديث بيانات الخدمة في قاعدة البيانات: ' + (err?.message || 'خطأ غير معروف') });
+    return;
+  }
 
   logAudit({
     userId: user.id,
     username: user.username,
     action: 'SERVICE_UPDATED',
     targetType: 'SERVICE',
-    targetId: service.id,
-    targetName: service.name_ar,
-    description: `قام المستخدم (${user.name}) بتحديث بيانات خدمة (${service.name_ar})`,
+    targetId: updatedService.id,
+    targetName: updatedService.name_ar,
+    description: `قام المستخدم (${user.name}) بتحديث بيانات خدمة (${updatedService.name_ar})`,
     ipAddress: getClientIp(req),
     changes: {
       before,
-      after: { ...service },
+      after: { ...updatedService },
     },
   });
 
-  res.json({ success: true, service });
+  res.json({ success: true, service: updatedService });
 });
 
 // DELETE /api/services/:id - Delete service
-servicesRouter.delete('/:id', requirePermission('delete_service'), (req: AuthenticatedRequest, res: Response) => {
+servicesRouter.delete('/:id', requirePermission('delete_service'), async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   const db = getDb();
   const index = db.services.findIndex((s) => s.id === req.params.id);
@@ -190,6 +210,12 @@ servicesRouter.delete('/:id', requirePermission('delete_service'), (req: Authent
 
   const service = db.services[index];
 
+  // Tenant Isolation: Non-super-admin users can only delete services in their own church
+  if (user.role !== 'super_admin' && service.church_id && user.church_id && service.church_id !== user.church_id) {
+    res.status(403).json({ error: 'غير مصرح: لا يمكنك حذف خدمة تابعة لكنيسة أخرى' });
+    return;
+  }
+
   // Check if servants are assigned to this service
   const assignedServants = db.servants.filter((s) => s.current_service_id === service.id);
   if (assignedServants.length > 0) {
@@ -199,9 +225,13 @@ servicesRouter.delete('/:id', requirePermission('delete_service'), (req: Authent
     return;
   }
 
-  recordDeletedId(service.id);
-  db.services.splice(index, 1);
-  saveDatabase();
+  try {
+    await deleteServiceAtomic(service.id);
+  } catch (err: any) {
+    console.error('Failed to delete service in Firestore:', err);
+    res.status(500).json({ error: 'فشل حذف الخدمة من قاعدة البيانات: ' + (err?.message || 'خطأ غير معروف') });
+    return;
+  }
 
   logAudit({
     userId: user.id,

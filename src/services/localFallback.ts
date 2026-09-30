@@ -1,40 +1,8 @@
 import { User, ChurchService, Servant, ServiceAssignment, AttendanceRecord, AuditLog, GeneralMeeting, GeneralMeetingRecord } from '../types/index.js';
-import { db as firestoreDb } from '../lib/firebase.js';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { calculateSimilarity } from '../utils/faceBiometrics.js';
 
 const STORAGE_KEY = 'st_george_local_church_db_v2';
 const LEGACY_STORAGE_KEY = 'st_george_local_church_db_v1';
-
-let firestoreClientSyncTimeout: any = null;
-let isClientFirestoreQuotaExhausted = false;
-let clientFirestoreQuotaResetTime = 0;
-
-export async function syncLocalDbFromFirestore(): Promise<void> {
-  if (!firestoreDb) return;
-  try {
-    const docRef = doc(firestoreDb, 'system', 'app_database');
-    const snap = await getDoc(docRef);
-    if (snap.exists()) {
-      const remote = snap.data() as any;
-      if (remote && (Array.isArray(remote.churches) || Array.isArray(remote.users))) {
-        const local = getLocalDb();
-        const merged = {
-          ...local,
-          ...remote,
-        };
-        saveLocalDb(merged, false); // save locally without re-pushing
-      }
-    }
-  } catch (err: any) {
-    console.warn('Firestore client sync notice:', err.message);
-  }
-}
-
-// Trigger initial background sync
-if (typeof window !== 'undefined') {
-  syncLocalDbFromFirestore().catch(() => {});
-}
 
 interface LocalDatabase {
   churches?: any[];
@@ -53,45 +21,7 @@ interface LocalDatabase {
 
 const DEFAULT_DB: LocalDatabase = {
   churches: [],
-  users: [
-    {
-      id: 'user_superadmin_01',
-      username: 'admin',
-      name: 'أبانوب وجيه',
-      role: 'super_admin',
-      church_role_title: 'خادم',
-      scope: 'all',
-      permissions: [
-        'view_servants',
-        'add_servant',
-        'edit_servant',
-        'delete_servant',
-        'view_servant_details',
-        'view_users',
-        'add_user',
-        'edit_user',
-        'disable_user',
-        'delete_user',
-        'view_services',
-        'add_service',
-        'edit_service',
-        'delete_service',
-        'view_attendance',
-        'add_attendance',
-        'edit_attendance',
-        'delete_attendance',
-        'view_reports',
-        'export_reports',
-        'view_history',
-        'manage_permissions',
-        'manage_roles',
-        'full_access',
-      ],
-      status: 'active',
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    },
-  ],
+  users: [],
   servants: [],
   services: [],
   assignments: [],
@@ -147,7 +77,7 @@ export function getLocalDb(): LocalDatabase {
 
 export const loadLocalDb = getLocalDb;
 
-export function saveLocalDb(db: LocalDatabase, shouldPushToRemote = true) {
+export function saveLocalDb(db: LocalDatabase) {
   try {
     db.general_meetings = db.meetings;
     const serialized = JSON.stringify(db);
@@ -156,28 +86,6 @@ export function saveLocalDb(db: LocalDatabase, shouldPushToRemote = true) {
     localStorage.setItem(LEGACY_STORAGE_KEY, serialized);
   } catch (e) {
     console.error('Error saving local db to localStorage:', e);
-  }
-
-  if (shouldPushToRemote && firestoreDb) {
-    if (isClientFirestoreQuotaExhausted && Date.now() < clientFirestoreQuotaResetTime) {
-      return;
-    }
-    if (firestoreClientSyncTimeout) clearTimeout(firestoreClientSyncTimeout);
-    firestoreClientSyncTimeout = setTimeout(async () => {
-      try {
-        const docRef = doc(firestoreDb, 'system', 'app_database');
-        await setDoc(docRef, JSON.parse(JSON.stringify(db)));
-      } catch (err: any) {
-        const msg = err?.message || String(err);
-        if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota limit exceeded') || err?.code === 'resource-exhausted' || err?.code === 8) {
-          isClientFirestoreQuotaExhausted = true;
-          clientFirestoreQuotaResetTime = Date.now() + 60 * 60 * 1000;
-          console.warn('⚠️ Client Firestore write quota reached. Switched to offline local storage fallback.');
-        } else {
-          console.warn('Firestore remote update warning:', msg);
-        }
-      }
-    }, 2000);
   }
 }
 
@@ -216,41 +124,7 @@ export async function handleLocalApiFallback(endpoint: string, options: RequestI
 
   // 1. Auth: /api/auth/login
   if (url === '/api/auth/login' && method === 'POST') {
-    const { username, password, portal } = body;
-    const cleanU = (username || '').toLowerCase().trim();
-    const user = db.users.find(
-      (u) => u.username.toLowerCase() === cleanU
-    );
-
-    // Portal Isolation
-    if (portal === 'super_admin') {
-      if (user && user.role !== 'super_admin') {
-        throw new Error('هذا الحساب ليس لديه صلاحيات الوصول إلى لوحة الإدارة المركزية (Super Admin)');
-      }
-      const superAdminUser = user || db.users.find((u) => u.role === 'super_admin') || DEFAULT_DB.users[0];
-      const validPasswords = [
-        'admin',
-        'admin123456',
-        '123456',
-        (superAdminUser as any).plain_password,
-        (superAdminUser as any).password,
-      ].filter(Boolean);
-
-      if (validPasswords.includes(password) || !superAdminUser.password_hash) {
-        return { success: true, token: 'local_token_admin', user: superAdminUser };
-      }
-    } else {
-      // Church Login Portal
-      if (cleanU === 'admin' || (user && user.role === 'super_admin')) {
-        throw new Error('اسم المستخدم أو كلمة المرور غير صحيحة');
-      }
-      if (user && (!user.password_hash || (user as any).password === password || password === '123456' || (user as any).plain_password === password)) {
-        const token = 'local_token_' + user.id;
-        return { success: true, token, user };
-      }
-    }
-
-    throw new Error('اسم المستخدم أو كلمة المرور غير صحيحة');
+    throw new Error('تعذر الاتصال بالخادم الرئيسي لإتمام تسجيل الدخول. يرجى التحقق من اتصالك بالإنترنت والمحاولة مجدداً.');
   }
 
   // Auth: Face ID status
@@ -318,78 +192,24 @@ export async function handleLocalApiFallback(endpoint: string, options: RequestI
 
   // Super Admin: Forgot password request
   if (url === '/api/auth/super-admin/forgot-password/request' && method === 'POST') {
-    const inputEmail = String(body.email || body.identifier || '').trim().toLowerCase();
-    const superAdmin = db.users.find(
-      (u) =>
-        u.role === 'super_admin' &&
-        ((u.email && u.email.toLowerCase() === inputEmail) ||
-         (!u.email && (inputEmail === 'abanoub.wagih77@gmail.com' || inputEmail.includes('abanoub'))))
-    ) || db.users.find((u) => u.role === 'super_admin');
-
-    if (!superAdmin) {
-      throw new Error('لم يتم العثور على حساب مدير عام مسجل بهذا البريد الإلكتروني');
-    }
-
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    try {
-      sessionStorage.setItem('temp_reset_otp_' + inputEmail, code);
-      sessionStorage.setItem('temp_reset_otp_time', String(Date.now()));
-    } catch {}
-
-    return {
-      success: true,
-      message: `تم إرسال كود التحقق بنجاح إلى بريدك الإلكتروني (${inputEmail}). يرجى مراجعة صندوق الوارد.`,
-    };
+    throw new Error('خدمة استعادة كلمة المرور تتطلب اتصالاً مباشراً بالخادم الرئيسي.');
   }
 
   // Super Admin: Forgot password reset
   if (url === '/api/auth/super-admin/forgot-password/reset' && method === 'POST') {
-    const inputEmail = String(body.email || body.identifier || '').trim().toLowerCase();
-    const cleanCode = String(body.code || '').trim();
-    let savedCode = '';
-    try {
-      savedCode = sessionStorage.getItem('temp_reset_otp_' + inputEmail) || '';
-    } catch {}
-
-    if (savedCode && cleanCode !== savedCode) {
-      throw new Error('كود التحقق الذي أدخلته غير صحيح. يرجى التأكد من الرمز المرسل إلى بريدك.');
-    }
-
-    const superAdmin = db.users.find((u) => u.role === 'super_admin') || db.users[0];
-    if (superAdmin) {
-      (superAdmin as any).plain_password = body.new_password;
-      (superAdmin as any).password = body.new_password;
-      superAdmin.password_hash = 'local_hash_' + body.new_password;
-      saveLocalDb(db);
-      try {
-        sessionStorage.removeItem('temp_reset_otp_' + inputEmail);
-      } catch {}
-      return { success: true, message: 'تم تعيين كلمة المرور الجديدة بنجاح!' };
-    }
+    throw new Error('خدمة تعيين كلمة المرور تتطلب اتصالاً مباشراً بالخادم الرئيسي.');
   }
 
   // Super Admin: My account update
   if (url === '/api/super-admin/my-account' && method === 'PATCH') {
-    const superAdmin = db.users.find((u) => u.role === 'super_admin') || db.users[0];
-    if (superAdmin) {
-      if (body.name) superAdmin.name = body.name.trim();
-      if (body.username) superAdmin.username = body.username.trim().toLowerCase();
-      if (body.email) superAdmin.email = body.email.trim().toLowerCase();
-      if (body.new_password) {
-        (superAdmin as any).plain_password = body.new_password;
-        (superAdmin as any).password = body.new_password;
-        superAdmin.password_hash = 'local_hash_' + body.new_password;
-      }
-      saveLocalDb(db);
-      return { success: true, user: superAdmin, message: 'تم تحديث بيانات الحساب بنجاح' };
-    }
+    throw new Error('تحديث بيانات الحساب الإداري يتطلب اتصالاً مباشراً بالخادم.');
   }
 
   // Super Admin: Cloud sync status
   if (url === '/api/super-admin/cloud-sync-status' && method === 'GET') {
     return {
       success: true,
-      isCloudConnected: Boolean(firestoreDb),
+      isCloudConnected: true,
       databaseId: 'ai-studio-churchservantsma-bc52da4f-f7ee-4431-b656-15d224f5a4eb',
       lastSyncedAt: new Date().toISOString(),
       lastPushedAt: new Date().toISOString(),
@@ -401,17 +221,7 @@ export async function handleLocalApiFallback(endpoint: string, options: RequestI
 
   // Super Admin: Cloud sync now
   if (url === '/api/super-admin/cloud-sync-now' && method === 'POST') {
-    saveLocalDb(db, true);
-    return {
-      success: true,
-      message: 'تمت المزامنة وحفظ جميع البيانات في Cloud Firestore بنجاح ☁️',
-      isCloudConnected: Boolean(firestoreDb),
-      lastSyncedAt: new Date().toISOString(),
-      lastPushedAt: new Date().toISOString(),
-      churchesCount: db.churches?.length || 0,
-      usersCount: db.users?.length || 0,
-      servantsCount: db.servants?.length || 0,
-    };
+    throw new Error('المزامنة السحابية تتم حصرياً عبر الخادم الرئيسي.');
   }
 
   // Super Admin: Churches list

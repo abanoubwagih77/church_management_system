@@ -1,8 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import bcrypt from 'bcryptjs';
-import { db as firestoreDb } from './firebase.js';
 import {
+  db as firestoreDb,
   doc,
   getDoc,
   setDoc,
@@ -13,7 +13,7 @@ import {
   writeBatch,
   runTransaction,
   increment,
-} from 'firebase/firestore';
+} from './firebase.js';
 import {
   User,
   Servant,
@@ -58,6 +58,7 @@ if (!fs.existsSync(DB_DIR)) {
 let dbData: DatabaseSchema;
 let pendingFirestoreWrite: Promise<any> | null = null;
 let isInitialSyncDone = false;
+let isInitialSyncSuccessful = false;
 let syncPromise: Promise<void> | null = null;
 let lastSyncedAt: number = 0;
 let lastPushedAt: number = 0;
@@ -66,10 +67,16 @@ let isFirestoreQuotaExhausted = false;
 let firestoreQuotaResetTime = 0;
 let firestorePushTimeout: NodeJS.Timeout | null = null;
 
+export function isFirestoreSyncReady(): boolean {
+  return isInitialSyncSuccessful;
+}
+
 export function getCloudSyncInfo() {
   return {
     isCloudConnected: Boolean(firestoreDb),
     databaseId: 'ai-studio-churchservantsma-bc52da4f-f7ee-4431-b656-15d224f5a4eb',
+    isInitialSyncSuccessful,
+    isInitialSyncDone,
     lastSyncedAt: lastSyncedAt ? new Date(lastSyncedAt).toISOString() : null,
     lastPushedAt: lastPushedAt ? new Date(lastPushedAt).toISOString() : null,
     lastSyncError,
@@ -119,7 +126,7 @@ function mergeCollection<T extends { id: string; updated_at?: string; created_at
       // If item was created or updated recently, preserve it so sync never drops newly added items!
       const createdTime = local.created_at ? new Date(local.created_at).getTime() : 0;
       const updatedTime = local.updated_at ? new Date(local.updated_at).getTime() : 0;
-      if (createdTime > tenMinutesAgo || updatedTime > tenMinutesAgo || !isProduction) {
+      if (createdTime > tenMinutesAgo || updatedTime > tenMinutesAgo) {
         map.set(local.id, local);
       }
     } else {
@@ -151,7 +158,7 @@ function mergeById<T extends { id: string; created_at?: string; updated_at?: str
     if (!map.has(local.id)) {
       const createdTime = local.created_at ? new Date(local.created_at).getTime() : 0;
       const updatedTime = local.updated_at ? new Date(local.updated_at).getTime() : 0;
-      if (createdTime > tenMinutesAgo || updatedTime > tenMinutesAgo || !isProduction) {
+      if (createdTime > tenMinutesAgo || updatedTime > tenMinutesAgo) {
         map.set(local.id, local);
       }
     }
@@ -161,6 +168,9 @@ function mergeById<T extends { id: string; created_at?: string; updated_at?: str
 
 export async function syncFromFirestore(): Promise<void> {
   if (!firestoreDb) return;
+  if (!dbData) {
+    initDatabase();
+  }
   try {
     // Timeout promise to ensure requests never hang indefinitely on Firestore network latency.
     const timeoutMs = (!isInitialSyncDone && isProduction) ? 8000 : 5000;
@@ -194,14 +204,38 @@ export async function syncFromFirestore(): Promise<void> {
       const legacyAttendanceData: AttendanceRecord[] = attendanceSnap?.data()?.items || [];
       const metaData = metaSnap?.data()?.items || {};
 
-      // Phase 1: Load independent documents from 'attendance' and 'general_meeting_records'
+      // Phase 1, 2B, 2C, 2D & 2E: Load independent documents from all isolated collections
       let indepAttendanceData: AttendanceRecord[] = [];
       let indepMeetingRecordsData: GeneralMeetingRecord[] = [];
+      let indepServantsData: Servant[] = [];
+      let indepServicesData: ChurchService[] = [];
+      let indepUsersData: User[] = [];
+      let indepChurchesData: Church[] = [];
+      let indepAssignmentsData: ServiceAssignment[] = [];
+      let indepGeneralMeetingsData: GeneralMeeting[] = [];
+      let indepScannerDevicesData: ScannerDevice[] = [];
 
       try {
-        const [attColSnap, gmrColSnap] = await Promise.all([
+        const [
+          attColSnap,
+          gmrColSnap,
+          srvColSnap,
+          srvcColSnap,
+          usersColSnap,
+          churchesColSnap,
+          asgColSnap,
+          gmColSnap,
+          scanColSnap,
+        ] = await Promise.all([
           getDocs(collection(firestoreDb, 'attendance')).catch(() => null),
           getDocs(collection(firestoreDb, 'general_meeting_records')).catch(() => null),
+          getDocs(collection(firestoreDb, 'servants')).catch(() => null),
+          getDocs(collection(firestoreDb, 'services')).catch(() => null),
+          getDocs(collection(firestoreDb, 'users')).catch(() => null),
+          getDocs(collection(firestoreDb, 'churches')).catch(() => null),
+          getDocs(collection(firestoreDb, 'assignments')).catch(() => null),
+          getDocs(collection(firestoreDb, 'general_meetings')).catch(() => null),
+          getDocs(collection(firestoreDb, 'scanner_devices')).catch(() => null),
         ]);
 
         if (attColSnap && !attColSnap.empty) {
@@ -218,6 +252,69 @@ export async function syncFromFirestore(): Promise<void> {
             const data = d.data() as GeneralMeetingRecord;
             if (data && data.servant_id && data.date && data.meeting_id) {
               indepMeetingRecordsData.push(data);
+            }
+          });
+        }
+
+        if (srvColSnap && !srvColSnap.empty) {
+          srvColSnap.forEach((d) => {
+            const data = d.data() as Servant;
+            if (data && data.id) {
+              indepServantsData.push(data);
+            }
+          });
+        }
+
+        if (srvcColSnap && !srvcColSnap.empty) {
+          srvcColSnap.forEach((d) => {
+            const data = d.data() as ChurchService;
+            if (data && data.id) {
+              indepServicesData.push(data);
+            }
+          });
+        }
+
+        if (usersColSnap && !usersColSnap.empty) {
+          usersColSnap.forEach((d) => {
+            const data = d.data() as User;
+            if (data && data.id) {
+              indepUsersData.push(data);
+            }
+          });
+        }
+
+        if (churchesColSnap && !churchesColSnap.empty) {
+          churchesColSnap.forEach((d) => {
+            const data = d.data() as Church;
+            if (data && data.id) {
+              indepChurchesData.push(data);
+            }
+          });
+        }
+
+        if (asgColSnap && !asgColSnap.empty) {
+          asgColSnap.forEach((d) => {
+            const data = d.data() as ServiceAssignment;
+            if (data && data.id) {
+              indepAssignmentsData.push(data);
+            }
+          });
+        }
+
+        if (gmColSnap && !gmColSnap.empty) {
+          gmColSnap.forEach((d) => {
+            const data = d.data() as GeneralMeeting;
+            if (data && data.id) {
+              indepGeneralMeetingsData.push(data);
+            }
+          });
+        }
+
+        if (scanColSnap && !scanColSnap.empty) {
+          scanColSnap.forEach((d) => {
+            const data = d.data() as ScannerDevice;
+            if (data && data.id) {
+              indepScannerDevicesData.push(data);
             }
           });
         }
@@ -265,20 +362,59 @@ export async function syncFromFirestore(): Promise<void> {
       }
       const finalGmr = Array.from(mergedGmrMap.values());
 
+      // Phase 2B, 2C, 2D & 2E: Independent collections for servants, services, users, churches, assignments, general_meetings, scanner_devices are authoritative
+      const localServants = dbData?.servants || [];
+      const localServices = dbData?.services || [];
+      const localUsers = dbData?.users || [];
+      const localChurches = dbData?.churches || [];
+      const localAssignments = dbData?.assignments || [];
+      const localMeetings = dbData?.general_meetings || [];
+      const localScanners = dbData?.scanner_devices || [];
+
+      const finalServants = indepServantsData.length > 0
+        ? mergeCollection(localServants, indepServantsData)
+        : mergeCollection(localServants, servantsData);
+
+      const finalServices = indepServicesData.length > 0
+        ? mergeCollection(localServices, indepServicesData)
+        : mergeCollection(localServices, servicesData);
+
+      const finalUsers = indepUsersData.length > 0
+        ? mergeCollection(localUsers, indepUsersData)
+        : mergeCollection(localUsers, usersData);
+
+      const finalChurches = indepChurchesData.length > 0
+        ? mergeCollection(localChurches, indepChurchesData)
+        : mergeCollection(localChurches, churchesData);
+
+      const finalAssignments = indepAssignmentsData.length > 0
+        ? mergeById(localAssignments, indepAssignmentsData)
+        : mergeById(localAssignments, metaData.assignments);
+
+      const finalGeneralMeetings = indepGeneralMeetingsData.length > 0
+        ? mergeById(localMeetings, indepGeneralMeetingsData)
+        : mergeById(localMeetings, metaData.general_meetings);
+
+      const finalScannerDevices = indepScannerDevicesData.length > 0
+        ? mergeById(localScanners, indepScannerDevicesData)
+        : mergeById(localScanners, metaData.scanner_devices);
+
       dbData = {
         ...dbData,
-        users: mergeCollection(dbData.users, usersData),
-        churches: mergeCollection(dbData.churches, churchesData),
-        servants: mergeCollection(dbData.servants, servantsData),
-        services: mergeCollection(dbData.services, servicesData),
+        users: finalUsers,
+        churches: finalChurches,
+        servants: finalServants,
+        services: finalServices,
         attendance: mergeCollection(dbData.attendance, finalAttendance),
-        assignments: mergeById(dbData.assignments, metaData.assignments),
-        general_meetings: mergeById(dbData.general_meetings, metaData.general_meetings),
+        assignments: finalAssignments,
+        general_meetings: finalGeneralMeetings,
         general_meeting_records: mergeById(dbData.general_meeting_records, finalGmr),
-        scanner_devices: mergeById(dbData.scanner_devices, metaData.scanner_devices),
+        scanner_devices: finalScannerDevices,
         audit_logs: mergeById(dbData.audit_logs, metaData.audit_logs),
       };
 
+      isInitialSyncSuccessful = true;
+      isInitialSyncDone = true;
       lastSyncedAt = Date.now();
       lastSyncError = null;
       try {
@@ -298,26 +434,19 @@ export async function syncFromFirestore(): Promise<void> {
           ...dbData,
           ...remote,
         };
+        isInitialSyncSuccessful = true;
+        isInitialSyncDone = true;
         lastSyncedAt = Date.now();
         lastSyncError = null;
         try {
           fs.writeFileSync(DB_FILE, JSON.stringify(dbData, null, 2), 'utf-8');
         } catch {}
         console.log('☁️ Database synced successfully from Cloud Firestore (Legacy doc).');
-
-        // Migrate to partitioned storage for infinite scalability and no 1MB doc ceiling (only if not in production startup)
-        if (!isProduction) {
-          pushToFirestoreImmediate().catch(() => {});
-        }
-      }
-    } else {
-      // First-time seed into Cloud Firestore if remote doc doesn't exist yet (NEVER auto-seed in production to prevent accidental overwrites)
-      if (!isProduction && dbData && Array.isArray(dbData.churches) && dbData.churches.length > 0) {
-        await pushToFirestoreImmediate();
-        console.log('☁️ Successfully seeded Cloud Firestore with initial database data.');
       }
     }
   } catch (err: any) {
+    isInitialSyncSuccessful = false;
+    isInitialSyncDone = false;
     const errMsg = err?.message || String(err);
     if (errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('Quota limit exceeded') || err?.code === 8 || err?.code === 'resource-exhausted') {
       isFirestoreQuotaExhausted = true;
@@ -329,6 +458,11 @@ export async function syncFromFirestore(): Promise<void> {
 }
 
 export function scheduleFirestorePush(delayMs = 3000): void {
+  // Startup Safety Guard: NEVER push before initial sync has succeeded!
+  if (!isInitialSyncSuccessful) {
+    console.warn('⚠️ Blocked scheduleFirestorePush: Initial Firestore sync is not completed yet.');
+    return;
+  }
   if (isFirestoreQuotaExhausted && Date.now() < firestoreQuotaResetTime) {
     return;
   }
@@ -343,6 +477,12 @@ export function scheduleFirestorePush(delayMs = 3000): void {
 export function pushToFirestoreImmediate(): Promise<void> {
   if (!firestoreDb || !dbData) return Promise.resolve();
 
+  // Startup Safety Guard: NEVER push to Firestore before initial sync has succeeded!
+  if (!isInitialSyncSuccessful) {
+    console.warn('⚠️ Blocked pushToFirestoreImmediate: Initial Firestore sync has not completed successfully yet. Remote production data is protected.');
+    return Promise.resolve();
+  }
+
   // If daily write quota is exhausted, skip remote Firestore calls completely
   if (isFirestoreQuotaExhausted && Date.now() < firestoreQuotaResetTime) {
     return Promise.resolve();
@@ -353,36 +493,33 @@ export function pushToFirestoreImmediate(): Promise<void> {
       const sanitized = JSON.parse(JSON.stringify(dbData));
 
       // 1. Write partitioned documents to avoid the 1MB Firestore document limit
-      const usersDocRef = doc(firestoreDb, 'system_data', 'users');
-      const churchesDocRef = doc(firestoreDb, 'system_data', 'churches');
-      const servantsDocRef = doc(firestoreDb, 'system_data', 'servants');
-      const servicesDocRef = doc(firestoreDb, 'system_data', 'services');
-      const attendanceDocRef = doc(firestoreDb, 'system_data', 'attendance');
       const metaDocRef = doc(firestoreDb, 'system_data', 'meta');
 
       const partitionedWrites = [
-        setDoc(usersDocRef, { items: sanitized.users || [] }),
-        setDoc(churchesDocRef, { items: sanitized.churches || [] }),
-        setDoc(servantsDocRef, { items: sanitized.servants || [] }),
-        setDoc(servicesDocRef, { items: sanitized.services || [] }),
-        // Note: Individual attendance documents are managed via atomic writeBatch in 'attendance' collection.
-        // We write system_data/attendance only if it exists, preserving legacy while prioritizing independent docs.
+        // Note: Users, Servants, Services, Churches, Assignments, General Meetings, and Scanner Devices are managed via isolated documents (Phase 2B, 2C, 2D & 2E).
+        // Legacy system_data/* documents remain preserved as historical backups and are NOT overwritten here.
+        // Individual attendance documents are managed via atomic writeBatch in 'attendance' collection.
         setDoc(metaDocRef, {
           items: {
-            assignments: sanitized.assignments || [],
-            general_meetings: sanitized.general_meetings || [],
-            scanner_devices: sanitized.scanner_devices || [],
             audit_logs: (sanitized.audit_logs || []).slice(-300),
           },
           updated_at: new Date().toISOString(),
-        }),
+        }, { merge: true }),
       ];
 
-      // Also update monolithic doc if within safe size (< 850 KB)
+      // Also update monolithic doc if within safe size (< 850 KB) without overwriting isolated entities
       const legacyDocRef = doc(firestoreDb, 'system', 'app_database');
-      const rawString = JSON.stringify(sanitized);
+      const sanitizedForLegacy = { ...sanitized };
+      delete sanitizedForLegacy.users;
+      delete sanitizedForLegacy.servants;
+      delete sanitizedForLegacy.services;
+      delete sanitizedForLegacy.churches;
+      delete sanitizedForLegacy.assignments;
+      delete sanitizedForLegacy.general_meetings;
+      delete sanitizedForLegacy.scanner_devices;
+      const rawString = JSON.stringify(sanitizedForLegacy);
       if (rawString.length < 850000) {
-        partitionedWrites.push(setDoc(legacyDocRef, sanitized));
+        partitionedWrites.push(setDoc(legacyDocRef, sanitizedForLegacy, { merge: true }));
       }
 
       await Promise.all(partitionedWrites);
@@ -431,7 +568,7 @@ export async function waitForPendingWrites(): Promise<void> {
 
 export async function ensureDatabaseReady(force = false): Promise<void> {
   // If already initialized and last sync was less than 8 seconds ago, skip network call
-  if (!force && isInitialSyncDone && dbData && (Date.now() - lastSyncedAt < 8000)) {
+  if (!force && isInitialSyncDone && isInitialSyncSuccessful && dbData && (Date.now() - lastSyncedAt < 8000)) {
     return;
   }
 
@@ -442,7 +579,6 @@ export async function ensureDatabaseReady(force = false): Promise<void> {
           initDatabase();
         }
         await syncFromFirestore();
-        isInitialSyncDone = true;
       } finally {
         syncPromise = null;
       }
@@ -526,8 +662,8 @@ export function initDatabase(): void {
             'full_access',
           ],
           status: 'active',
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
+          created_at: '1970-01-01T00:00:00.000Z',
+          updated_at: '1970-01-01T00:00:00.000Z',
           password_hash: bcrypt.hashSync('admin', salt),
         };
         dbData.users.push(newSuperAdmin);
@@ -580,8 +716,8 @@ export function initDatabase(): void {
       'full_access',
     ],
     status: 'active',
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    created_at: '1970-01-01T00:00:00.000Z',
+    updated_at: '1970-01-01T00:00:00.000Z',
     password_hash: defaultHash,
   };
 
@@ -610,15 +746,15 @@ export function initDatabase(): void {
     rate_limits: {},
   };
 
-  // In production, never write local fallback directly to Firestore on startup.
-  if (!isProduction) {
-    saveDatabase();
-  }
   syncFromFirestore().catch(() => {});
 }
 
 export function saveDatabase(): void {
   saveLocalDatabaseOnly();
+  if (!isInitialSyncSuccessful) {
+    console.warn('⚠️ Blocked saveDatabase cloud push: Initial Firestore sync is not completed yet.');
+    return;
+  }
   if (isProduction) {
     pushToFirestoreImmediate().catch((err) => {
       console.warn('⚠️ Cloud Firestore push error:', err);
@@ -645,7 +781,37 @@ export function saveLocalDatabaseOnly(): void {
 
 export async function saveDatabaseAsync(): Promise<void> {
   saveLocalDatabaseOnly();
+  if (!isInitialSyncSuccessful) {
+    console.warn('⚠️ Blocked saveDatabaseAsync cloud push: Initial Firestore sync is not completed yet.');
+    return;
+  }
   await pushToFirestoreImmediate();
+}
+
+/**
+ * Isolated update for user last_login.
+ * Updates in-memory user and local file, and writes directly to users/{userId} in Firestore.
+ * NEVER calls pushToFirestoreImmediate and NEVER touches any other collection.
+ */
+export async function updateUserLastLogin(userId: string, lastLoginIso: string): Promise<void> {
+  // 1. Update in-memory user and local file
+  if (dbData && Array.isArray(dbData.users)) {
+    const user = dbData.users.find((u) => u.id === userId);
+    if (user) {
+      user.last_login = lastLoginIso;
+    }
+    saveLocalDatabaseOnly();
+  }
+
+  // 2. Isolated Firestore update on users/{userId} directly
+  if (firestoreDb && isInitialSyncSuccessful) {
+    try {
+      const userDocRef = doc(firestoreDb, 'users', userId);
+      await setDoc(userDocRef, { last_login: lastLoginIso }, { merge: true });
+    } catch (err) {
+      console.warn('Non-blocking user last_login Firestore update warning:', err);
+    }
+  }
 }
 
 export function getDb(): DatabaseSchema {
@@ -653,6 +819,566 @@ export function getDb(): DatabaseSchema {
     initDatabase();
   }
   return dbData;
+}
+
+// ============================================================================
+// PHASE 2B: ATOMIC FIRESTORE MUTATION HELPERS (SERVANTS & SERVICES)
+// ============================================================================
+
+export async function createServantAtomic(
+  servant: Servant,
+  initialAssignment?: ServiceAssignment
+): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const batch = writeBatch(firestoreDb);
+  const servantDocRef = doc(firestoreDb, 'servants', servant.id);
+  batch.set(servantDocRef, servant);
+
+  if (initialAssignment) {
+    const asgDocRef = doc(firestoreDb, 'assignments', initialAssignment.id);
+    batch.set(asgDocRef, initialAssignment);
+  }
+
+  await batch.commit();
+
+  if (dbData) {
+    if (!dbData.servants) dbData.servants = [];
+    dbData.servants.push(servant);
+    if (initialAssignment) {
+      if (!dbData.assignments) dbData.assignments = [];
+      dbData.assignments.push(initialAssignment);
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function updateServantAtomic(
+  servant: Servant,
+  updatedAssignments?: ServiceAssignment[]
+): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const batch = writeBatch(firestoreDb);
+  const servantDocRef = doc(firestoreDb, 'servants', servant.id);
+  batch.set(servantDocRef, servant, { merge: true });
+
+  if (updatedAssignments) {
+    for (const asg of updatedAssignments) {
+      const asgDocRef = doc(firestoreDb, 'assignments', asg.id);
+      batch.set(asgDocRef, asg);
+    }
+  }
+
+  await batch.commit();
+
+  if (dbData) {
+    if (!dbData.servants) dbData.servants = [];
+    const idx = dbData.servants.findIndex((s) => s.id === servant.id);
+    if (idx !== -1) {
+      dbData.servants[idx] = { ...dbData.servants[idx], ...servant };
+    } else {
+      dbData.servants.push(servant);
+    }
+    if (updatedAssignments) {
+      dbData.assignments = updatedAssignments;
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function updateServantStatusAtomic(
+  servantId: string,
+  newStatus: 'active' | 'inactive',
+  updatedAt: string
+): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const servantDocRef = doc(firestoreDb, 'servants', servantId);
+  await updateDoc(servantDocRef, {
+    status: newStatus,
+    updated_at: updatedAt,
+  });
+
+  if (dbData && dbData.servants) {
+    const s = dbData.servants.find((item) => item.id === servantId);
+    if (s) {
+      s.status = newStatus;
+      s.updated_at = updatedAt;
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function transferServantAtomic(params: {
+  servant: Servant;
+  newAssignment: ServiceAssignment;
+  updatedAssignments: ServiceAssignment[];
+  linkedUser?: User;
+}): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const { servant, newAssignment, updatedAssignments, linkedUser } = params;
+  const batch = writeBatch(firestoreDb);
+
+  const servantDocRef = doc(firestoreDb, 'servants', servant.id);
+  batch.update(servantDocRef, {
+    current_service_id: servant.current_service_id,
+    current_role: servant.current_role,
+    updated_at: servant.updated_at,
+  });
+
+  const newAsgDocRef = doc(firestoreDb, 'assignments', newAssignment.id);
+  batch.set(newAsgDocRef, newAssignment);
+
+  if (updatedAssignments) {
+    for (const asg of updatedAssignments) {
+      const asgDocRef = doc(firestoreDb, 'assignments', asg.id);
+      batch.set(asgDocRef, asg);
+    }
+  }
+
+  if (linkedUser) {
+    const linkedUserDocRef = doc(firestoreDb, 'users', linkedUser.id);
+    batch.set(linkedUserDocRef, {
+      scope: linkedUser.scope,
+      updated_at: linkedUser.updated_at,
+    }, { merge: true });
+  }
+
+  await batch.commit();
+
+  if (dbData) {
+    if (!dbData.servants) dbData.servants = [];
+    const idx = dbData.servants.findIndex((s) => s.id === servant.id);
+    if (idx !== -1) {
+      dbData.servants[idx] = { ...dbData.servants[idx], ...servant };
+    }
+    dbData.assignments = updatedAssignments;
+    if (linkedUser && dbData.users) {
+      const uIdx = dbData.users.findIndex((u) => u.id === linkedUser.id);
+      if (uIdx !== -1) {
+        dbData.users[uIdx] = { ...dbData.users[uIdx], ...linkedUser };
+      }
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function deleteServantAtomic(servantId: string): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const batch = writeBatch(firestoreDb);
+  const servantDocRef = doc(firestoreDb, 'servants', servantId);
+  batch.delete(servantDocRef);
+
+  const remainingAssignments = (dbData?.assignments || []).filter((a) => a.servant_id !== servantId);
+  const deletedAssignments = (dbData?.assignments || []).filter((a) => a.servant_id === servantId);
+  for (const asg of deletedAssignments) {
+    const asgDocRef = doc(firestoreDb, 'assignments', asg.id);
+    batch.delete(asgDocRef);
+  }
+
+  await batch.commit();
+
+  if (dbData) {
+    recordDeletedId(servantId);
+    if (dbData.servants) {
+      dbData.servants = dbData.servants.filter((s) => s.id !== servantId);
+    }
+    dbData.assignments = remainingAssignments;
+    if (dbData.attendance) {
+      dbData.attendance = dbData.attendance.filter((a) => a.servant_id !== servantId);
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function createServiceAtomic(service: ChurchService): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const serviceDocRef = doc(firestoreDb, 'services', service.id);
+  await setDoc(serviceDocRef, service);
+
+  if (dbData) {
+    if (!dbData.services) dbData.services = [];
+    dbData.services.push(service);
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function updateServiceAtomic(service: ChurchService): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const serviceDocRef = doc(firestoreDb, 'services', service.id);
+  await setDoc(serviceDocRef, service, { merge: true });
+
+  if (dbData) {
+    if (!dbData.services) dbData.services = [];
+    const idx = dbData.services.findIndex((s) => s.id === service.id);
+    if (idx !== -1) {
+      dbData.services[idx] = { ...dbData.services[idx], ...service };
+    } else {
+      dbData.services.push(service);
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function deleteServiceAtomic(serviceId: string): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const serviceDocRef = doc(firestoreDb, 'services', serviceId);
+  await deleteDoc(serviceDocRef);
+
+  if (dbData) {
+    recordDeletedId(serviceId);
+    if (dbData.services) {
+      dbData.services = dbData.services.filter((s) => s.id !== serviceId);
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+// ============================================================================
+// PHASE 2C: ATOMIC FIRESTORE MUTATION HELPERS (USERS & ACCOUNTS)
+// ============================================================================
+
+export async function createUserAtomic(user: User): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const userDocRef = doc(firestoreDb, 'users', user.id);
+  await setDoc(userDocRef, user);
+
+  if (dbData) {
+    if (!dbData.users) dbData.users = [];
+    dbData.users.push(user);
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function updateUserAtomic(userId: string, updates: Partial<User>): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const userDocRef = doc(firestoreDb, 'users', userId);
+  const nowIso = updates.updated_at || new Date().toISOString();
+  const payloadToSave = { ...updates, updated_at: nowIso };
+
+  await setDoc(userDocRef, payloadToSave, { merge: true });
+
+  if (dbData && dbData.users) {
+    const idx = dbData.users.findIndex((u) => u.id === userId);
+    if (idx !== -1) {
+      dbData.users[idx] = { ...dbData.users[idx], ...payloadToSave };
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function deleteUserAtomic(userId: string): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const userDocRef = doc(firestoreDb, 'users', userId);
+  await deleteDoc(userDocRef);
+
+  if (dbData) {
+    recordDeletedId(userId);
+    if (dbData.users) {
+      dbData.users = dbData.users.filter((u) => u.id !== userId);
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function updateUserPasswordAtomic(
+  userId: string,
+  newHash: string,
+  plainPasswordHint?: string
+): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const userDocRef = doc(firestoreDb, 'users', userId);
+  const nowIso = new Date().toISOString();
+  const updatePayload: Record<string, any> = {
+    password_hash: newHash,
+    must_change_password: false,
+    updated_at: nowIso,
+  };
+  if (plainPasswordHint !== undefined) {
+    updatePayload.plain_password_hint = plainPasswordHint;
+  }
+
+  await setDoc(userDocRef, updatePayload, { merge: true });
+
+  if (dbData && dbData.users) {
+    const user = dbData.users.find((u) => u.id === userId);
+    if (user) {
+      user.password_hash = newHash;
+      user.must_change_password = false;
+      user.updated_at = nowIso;
+      if (plainPasswordHint !== undefined) {
+        user.plain_password_hint = plainPasswordHint;
+      }
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function updateUserFaceAtomic(
+  userId: string,
+  biometricData: string | undefined,
+  enrolledAt: string | undefined
+): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const userDocRef = doc(firestoreDb, 'users', userId);
+  const nowIso = new Date().toISOString();
+  const updatePayload: Record<string, any> = {
+    face_biometric_data: biometricData ?? null,
+    face_enrolled_at: enrolledAt ?? null,
+    updated_at: nowIso,
+  };
+
+  await setDoc(userDocRef, updatePayload, { merge: true });
+
+  if (dbData && dbData.users) {
+    const user = dbData.users.find((u) => u.id === userId);
+    if (user) {
+      user.face_biometric_data = biometricData;
+      user.face_enrolled_at = enrolledAt;
+      user.updated_at = nowIso;
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function bulkCreateUsersAtomic(newUsers: User[]): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+  if (!newUsers || newUsers.length === 0) return;
+
+  const batch = writeBatch(firestoreDb);
+  for (const u of newUsers) {
+    const userDocRef = doc(firestoreDb, 'users', u.id);
+    batch.set(userDocRef, u);
+  }
+
+  await batch.commit();
+
+  if (dbData) {
+    if (!dbData.users) dbData.users = [];
+    dbData.users.push(...newUsers);
+    saveLocalDatabaseOnly();
+  }
+}
+
+// ============================================================================
+// PHASE 2D: ATOMIC FIRESTORE MUTATION HELPERS (CHURCHES & TENANTS)
+// ============================================================================
+
+export async function createChurchAtomic(church: Church): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const churchDocRef = doc(firestoreDb, 'churches', church.id);
+  await setDoc(churchDocRef, church);
+
+  if (dbData) {
+    if (!dbData.churches) dbData.churches = [];
+    dbData.churches.push(church);
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function updateChurchAtomic(churchId: string, updates: Partial<Church>): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const churchDocRef = doc(firestoreDb, 'churches', churchId);
+  const nowIso = updates.updated_at || new Date().toISOString();
+  const payloadToSave = { ...updates, updated_at: nowIso };
+
+  await setDoc(churchDocRef, payloadToSave, { merge: true });
+
+  if (dbData && dbData.churches) {
+    const idx = dbData.churches.findIndex((c) => c.id === churchId);
+    if (idx !== -1) {
+      dbData.churches[idx] = { ...dbData.churches[idx], ...payloadToSave };
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function deleteChurchAtomic(churchId: string): Promise<void> {
+  if (!firestoreDb) {
+    throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  }
+
+  const churchDocRef = doc(firestoreDb, 'churches', churchId);
+  await deleteDoc(churchDocRef);
+
+  if (dbData) {
+    recordDeletedId(churchId);
+    if (dbData.churches) {
+      dbData.churches = dbData.churches.filter((c) => c.id !== churchId);
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+// ============================================================================
+// PHASE 2E: ATOMIC FIRESTORE MUTATION HELPERS (ASSIGNMENTS, GENERAL MEETINGS, SCANNERS)
+// ============================================================================
+
+export async function createAssignmentAtomic(assignment: ServiceAssignment): Promise<void> {
+  if (!firestoreDb) throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  const asgRef = doc(firestoreDb, 'assignments', assignment.id);
+  await setDoc(asgRef, assignment);
+  if (dbData) {
+    if (!dbData.assignments) dbData.assignments = [];
+    dbData.assignments.push(assignment);
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function updateAssignmentAtomic(
+  assignmentId: string,
+  updates: Partial<ServiceAssignment>
+): Promise<void> {
+  if (!firestoreDb) throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  const asgRef = doc(firestoreDb, 'assignments', assignmentId);
+  await setDoc(asgRef, updates, { merge: true });
+  if (dbData && dbData.assignments) {
+    const idx = dbData.assignments.findIndex((a) => a.id === assignmentId);
+    if (idx !== -1) {
+      dbData.assignments[idx] = { ...dbData.assignments[idx], ...updates };
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function deleteAssignmentAtomic(assignmentId: string): Promise<void> {
+  if (!firestoreDb) throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  const asgRef = doc(firestoreDb, 'assignments', assignmentId);
+  await deleteDoc(asgRef);
+  if (dbData) {
+    recordDeletedId(assignmentId);
+    if (dbData.assignments) {
+      dbData.assignments = dbData.assignments.filter((a) => a.id !== assignmentId);
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function createGeneralMeetingAtomic(meeting: GeneralMeeting): Promise<void> {
+  if (!firestoreDb) throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  const ref = doc(firestoreDb, 'general_meetings', meeting.id);
+  await setDoc(ref, meeting);
+  if (dbData) {
+    if (!dbData.general_meetings) dbData.general_meetings = [];
+    dbData.general_meetings.push(meeting);
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function updateGeneralMeetingAtomic(
+  meetingId: string,
+  updates: Partial<GeneralMeeting>
+): Promise<void> {
+  if (!firestoreDb) throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  const ref = doc(firestoreDb, 'general_meetings', meetingId);
+  const nowIso = updates.updated_at || new Date().toISOString();
+  const payload = { ...updates, updated_at: nowIso };
+  await setDoc(ref, payload, { merge: true });
+  if (dbData && dbData.general_meetings) {
+    const idx = dbData.general_meetings.findIndex((m) => m.id === meetingId);
+    if (idx !== -1) {
+      dbData.general_meetings[idx] = { ...dbData.general_meetings[idx], ...payload };
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function deleteGeneralMeetingAtomic(meetingId: string): Promise<void> {
+  if (!firestoreDb) throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  const ref = doc(firestoreDb, 'general_meetings', meetingId);
+  await deleteDoc(ref);
+  if (dbData) {
+    recordDeletedId(meetingId);
+    if (dbData.general_meetings) {
+      dbData.general_meetings = dbData.general_meetings.filter((m) => m.id !== meetingId);
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function createScannerDeviceAtomic(device: ScannerDevice): Promise<void> {
+  if (!firestoreDb) throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  const ref = doc(firestoreDb, 'scanner_devices', device.id);
+  await setDoc(ref, device);
+  if (dbData) {
+    if (!dbData.scanner_devices) dbData.scanner_devices = [];
+    dbData.scanner_devices.push(device);
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function updateScannerDeviceAtomic(
+  deviceId: string,
+  updates: Partial<ScannerDevice>
+): Promise<void> {
+  if (!firestoreDb) throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  const ref = doc(firestoreDb, 'scanner_devices', deviceId);
+  await setDoc(ref, updates, { merge: true });
+  if (dbData && dbData.scanner_devices) {
+    const idx = dbData.scanner_devices.findIndex((d) => d.id === deviceId);
+    if (idx !== -1) {
+      dbData.scanner_devices[idx] = { ...dbData.scanner_devices[idx], ...updates };
+    }
+    saveLocalDatabaseOnly();
+  }
+}
+
+export async function deleteScannerDeviceAtomic(deviceId: string): Promise<void> {
+  if (!firestoreDb) throw new Error('قاعدة بيانات فايربيز غير متصلة');
+  const ref = doc(firestoreDb, 'scanner_devices', deviceId);
+  await deleteDoc(ref);
+  if (dbData) {
+    recordDeletedId(deviceId);
+    if (dbData.scanner_devices) {
+      dbData.scanner_devices = dbData.scanner_devices.filter((d) => d.id !== deviceId);
+    }
+    saveLocalDatabaseOnly();
+  }
 }
 
 // ============================================================================

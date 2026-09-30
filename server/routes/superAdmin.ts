@@ -1,7 +1,26 @@
 import { Router, Response } from 'express';
 import bcrypt from 'bcryptjs';
-import { getDb, saveDatabase, saveDatabaseAsync, getCloudSyncInfo, pushToFirestoreImmediate, syncFromFirestore, recordDeletedId } from '../db.js';
-import { authenticateJwt, requireSuperAdmin, AuthenticatedRequest } from '../auth.js';
+import {
+  getDb,
+  saveDatabase,
+  saveDatabaseAsync,
+  getCloudSyncInfo,
+  pushToFirestoreImmediate,
+  syncFromFirestore,
+  recordDeletedId,
+  saveLocalDatabaseOnly,
+  createUserAtomic,
+  updateUserAtomic,
+  deleteUserAtomic,
+  updateUserPasswordAtomic,
+  updateUserFaceAtomic,
+  deleteServantAtomic,
+  deleteServiceAtomic,
+  createChurchAtomic,
+  updateChurchAtomic,
+  deleteChurchAtomic,
+} from '../db.js';
+import { authenticateJwt, requireSuperAdmin, AuthenticatedRequest, sanitizeUser } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { Church, User, ChurchStatus, PermissionKey } from '../../src/types/index.js';
 
@@ -219,11 +238,8 @@ superAdminRouter.post('/churches', async (req: AuthenticatedRequest, res: Respon
       updated_at: new Date().toISOString(),
     };
 
-    if (!db.churches) db.churches = [];
-    db.churches.push(newChurch);
-    db.users.push(churchAdminUser);
-
-    await saveDatabaseAsync();
+    await createChurchAtomic(newChurch);
+    await createUserAtomic(churchAdminUser);
 
     logAudit({
       userId: req.user!.id,
@@ -285,7 +301,7 @@ superAdminRouter.get('/churches/:id', (req: AuthenticatedRequest, res: Response)
 });
 
 // PUT /api/super-admin/churches/:id - Update church info
-superAdminRouter.put('/churches/:id', (req: AuthenticatedRequest, res: Response) => {
+superAdminRouter.put('/churches/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const db = getDb();
     const church = db.churches?.find((c) => c.id === req.params.id);
@@ -325,6 +341,7 @@ superAdminRouter.put('/churches/:id', (req: AuthenticatedRequest, res: Response)
     );
 
     if (adminUser) {
+      const userUpdates: Partial<User> = {};
       if (admin_username && String(admin_username).trim()) {
         const cleanUsername = String(admin_username).trim().toLowerCase();
         if (cleanUsername !== adminUser.username.toLowerCase()) {
@@ -335,7 +352,7 @@ superAdminRouter.put('/churches/:id', (req: AuthenticatedRequest, res: Response)
             res.status(400).json({ error: 'اسم المستخدم هذا مستخدم بالفعل من قبل حساب آخر، يرجى اختيار اسم آخر' });
             return;
           }
-          adminUser.username = cleanUsername;
+          userUpdates.username = cleanUsername;
         }
       }
 
@@ -346,19 +363,33 @@ superAdminRouter.put('/churches/:id', (req: AuthenticatedRequest, res: Response)
           return;
         }
         const salt = bcrypt.genSaltSync(10);
-        adminUser.password_hash = bcrypt.hashSync(cleanPassword, salt);
-        adminUser.plain_password_hint = cleanPassword;
+        userUpdates.password_hash = bcrypt.hashSync(cleanPassword, salt);
+        userUpdates.plain_password_hint = cleanPassword;
       }
 
       if (admin_name && String(admin_name).trim()) {
-        adminUser.name = String(admin_name).trim();
+        userUpdates.name = String(admin_name).trim();
       }
 
-      adminUser.updated_at = new Date().toISOString();
+      if (Object.keys(userUpdates).length > 0) {
+        userUpdates.updated_at = new Date().toISOString();
+        await updateUserAtomic(adminUser.id, userUpdates);
+      }
     }
 
-    church.updated_at = new Date().toISOString();
-    saveDatabase();
+    const churchUpdates: Partial<Church> = {};
+    if (name) churchUpdates.name = name.trim();
+    if (diocese !== undefined) churchUpdates.diocese = diocese.trim();
+    if (bishop_name !== undefined) churchUpdates.bishop_name = bishop_name.trim();
+    if (address !== undefined) churchUpdates.address = address.trim();
+    if (phone !== undefined) churchUpdates.phone = phone.trim();
+    if (email !== undefined) churchUpdates.email = email.trim();
+    if (verse !== undefined) churchUpdates.verse = verse.trim();
+    if (logo_url !== undefined) churchUpdates.logo_url = logo_url;
+    if (social_links !== undefined) churchUpdates.social_links = social_links;
+
+    churchUpdates.updated_at = new Date().toISOString();
+    await updateChurchAtomic(church.id, churchUpdates);
 
     logAudit({
       userId: req.user!.id,
@@ -370,14 +401,15 @@ superAdminRouter.put('/churches/:id', (req: AuthenticatedRequest, res: Response)
       description: `قام المدير العام بتحديث بيانات كنيسة (${church.name}) وبيانات حساب مسؤولها`,
     });
 
-    res.json({ success: true, church, message: 'تم تحديث بيانات الكنيسة وحساب المسؤول بنجاح' });
+    const updatedChurch = db.churches?.find((c) => c.id === church.id) || church;
+    res.json({ success: true, church: updatedChurch, message: 'تم تحديث بيانات الكنيسة وحساب المسؤول بنجاح' });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'فشل تحديث بيانات الكنيسة' });
   }
 });
 
 // PATCH /api/super-admin/churches/:id/status - Change status (active, inactive, suspended, trial)
-superAdminRouter.patch('/churches/:id/status', (req: AuthenticatedRequest, res: Response) => {
+superAdminRouter.patch('/churches/:id/status', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const db = getDb();
     const church = db.churches?.find((c) => c.id === req.params.id);
@@ -393,9 +425,10 @@ superAdminRouter.patch('/churches/:id/status', (req: AuthenticatedRequest, res: 
       return;
     }
 
-    church.status = status;
-    church.updated_at = new Date().toISOString();
-    saveDatabase();
+    await updateChurchAtomic(church.id, {
+      status,
+      updated_at: new Date().toISOString(),
+    });
 
     logAudit({
       userId: req.user!.id,
@@ -418,7 +451,7 @@ superAdminRouter.patch('/churches/:id/status', (req: AuthenticatedRequest, res: 
 });
 
 // POST /api/super-admin/churches/:id/reset-admin-password - Reset church admin password and username
-superAdminRouter.post('/churches/:id/reset-admin-password', (req: AuthenticatedRequest, res: Response) => {
+superAdminRouter.post('/churches/:id/reset-admin-password', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const db = getDb();
     const church = db.churches?.find((c) => c.id === req.params.id);
@@ -437,6 +470,7 @@ superAdminRouter.post('/churches/:id/reset-admin-password', (req: AuthenticatedR
 
     let updatedUsername = false;
     let updatedPassword = false;
+    let cleanNewPassword = '';
 
     if (new_username && String(new_username).trim()) {
       const cleanUsername = String(new_username).trim().toLowerCase();
@@ -459,7 +493,7 @@ superAdminRouter.post('/churches/:id/reset-admin-password', (req: AuthenticatedR
         return;
       }
       const salt = bcrypt.genSaltSync(10);
-      const cleanNewPassword = String(new_password).trim();
+      cleanNewPassword = String(new_password).trim();
       adminUser.password_hash = bcrypt.hashSync(cleanNewPassword, salt);
       adminUser.plain_password_hint = cleanNewPassword;
       updatedPassword = true;
@@ -470,8 +504,14 @@ superAdminRouter.post('/churches/:id/reset-admin-password', (req: AuthenticatedR
       return;
     }
 
-    adminUser.updated_at = new Date().toISOString();
-    saveDatabase();
+    const nowIso = new Date().toISOString();
+    adminUser.updated_at = nowIso;
+    if (updatedPassword) {
+      await updateUserPasswordAtomic(adminUser.id, adminUser.password_hash, cleanNewPassword);
+    }
+    if (updatedUsername) {
+      await updateUserAtomic(adminUser.id, { username: adminUser.username, updated_at: nowIso });
+    }
 
     logAudit({
       userId: req.user!.id,
@@ -494,7 +534,7 @@ superAdminRouter.post('/churches/:id/reset-admin-password', (req: AuthenticatedR
 });
 
 // PATCH /api/super-admin/churches/:id/subscription - Update subscription & payment status
-superAdminRouter.patch('/churches/:id/subscription', (req: AuthenticatedRequest, res: Response) => {
+superAdminRouter.patch('/churches/:id/subscription', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const db = getDb();
     const church = db.churches?.find((c) => c.id === req.params.id);
@@ -505,33 +545,38 @@ superAdminRouter.patch('/churches/:id/subscription', (req: AuthenticatedRequest,
 
     const { plan, payment_status, status, end_date, next_due_date, fee, notes } = req.body || {};
 
-    if (!church.subscription) {
-      church.subscription = {
+    const updatedSub = {
+      ...(church.subscription || {
         plan: 'basic',
         status: 'active',
         start_date: new Date().toISOString(),
-      };
-    }
+      }),
+    };
 
-    if (plan !== undefined) church.subscription.plan = plan;
-    if (payment_status !== undefined) church.subscription.payment_status = payment_status;
-    if (status !== undefined) church.subscription.status = status;
-    if (end_date !== undefined) church.subscription.end_date = end_date;
-    if (next_due_date !== undefined) church.subscription.next_due_date = next_due_date;
-    if (fee !== undefined) church.subscription.fee = Number(fee);
-    if (notes !== undefined) church.subscription.notes = notes;
+    if (plan !== undefined) updatedSub.plan = plan;
+    if (payment_status !== undefined) updatedSub.payment_status = payment_status;
+    if (status !== undefined) updatedSub.status = status;
+    if (end_date !== undefined) updatedSub.end_date = end_date;
+    if (next_due_date !== undefined) updatedSub.next_due_date = next_due_date;
+    if (fee !== undefined) updatedSub.fee = Number(fee);
+    if (notes !== undefined) updatedSub.notes = notes;
 
+    let targetStatus = church.status;
     if (payment_status === 'paid') {
-      church.subscription.last_payment_date = new Date().toISOString();
+      updatedSub.last_payment_date = new Date().toISOString();
       if (church.status === 'suspended') {
-        church.status = 'active';
+        targetStatus = 'active';
       }
     } else if (payment_status === 'overdue' && status === 'expired') {
-      church.status = 'suspended';
+      targetStatus = 'suspended';
     }
 
-    church.updated_at = new Date().toISOString();
-    saveDatabase();
+    const nowIso = new Date().toISOString();
+    await updateChurchAtomic(church.id, {
+      subscription: updatedSub,
+      status: targetStatus,
+      updated_at: nowIso,
+    });
 
     logAudit({
       userId: req.user!.id,
@@ -554,7 +599,7 @@ superAdminRouter.patch('/churches/:id/subscription', (req: AuthenticatedRequest,
 });
 
 // POST /api/super-admin/churches/:id/send-renewal-alert - Send renewal reminder notification to church
-superAdminRouter.post('/churches/:id/send-renewal-alert', (req: AuthenticatedRequest, res: Response) => {
+superAdminRouter.post('/churches/:id/send-renewal-alert', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const db = getDb();
     const church = db.churches?.find((c) => c.id === req.params.id);
@@ -565,27 +610,30 @@ superAdminRouter.post('/churches/:id/send-renewal-alert', (req: AuthenticatedReq
 
     const { custom_message } = req.body || {};
 
-    if (!church.subscription) {
-      church.subscription = {
+    const updatedSub = {
+      ...(church.subscription || {
         plan: 'basic',
         status: 'active',
         start_date: new Date().toISOString(),
-      };
-    }
+      }),
+    };
 
-    const dueDate = church.subscription.next_due_date || 'قريباً';
-    const feeText = church.subscription.fee ? `${church.subscription.fee} ج.م` : '';
+    const dueDate = updatedSub.next_due_date || 'قريباً';
+    const feeText = updatedSub.fee ? `${updatedSub.fee} ج.م` : '';
     const defaultMsg = `تذكير من الإدارة المركزية: موعد تجديد اشتراك الكنيسة السنوي يستحق في (${dueDate}) ${feeText ? `بقيمة ${feeText}` : ''}. يرجى التنسيق لسداد الرسوم عبر قنوات التواصل المعتمدة أو الاتصال على رقم 01012348828 (م/ أبانوب وجيه) لضمان استمرار كافة الخدمات والأنظمة.`;
 
-    church.subscription.renewal_notice = {
+    updatedSub.renewal_notice = {
       sent_at: new Date().toISOString(),
       sent_by_name: req.user!.name,
       message: custom_message?.trim() || defaultMsg,
       acknowledged: false,
     };
 
-    church.updated_at = new Date().toISOString();
-    saveDatabase();
+    const nowIso = new Date().toISOString();
+    await updateChurchAtomic(church.id, {
+      subscription: updatedSub,
+      updated_at: nowIso,
+    });
 
     logAudit({
       userId: req.user!.id,
@@ -608,7 +656,7 @@ superAdminRouter.post('/churches/:id/send-renewal-alert', (req: AuthenticatedReq
 });
 
 // PATCH /api/super-admin/my-account - Allow Super Admin to update their name, username, and password
-superAdminRouter.patch('/my-account', (req: AuthenticatedRequest, res: Response) => {
+superAdminRouter.patch('/my-account', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const db = getDb();
     const user = db.users.find((u) => u.id === req.user!.id && u.role === 'super_admin');
@@ -666,7 +714,13 @@ superAdminRouter.patch('/my-account', (req: AuthenticatedRequest, res: Response)
     }
 
     user.updated_at = new Date().toISOString();
-    saveDatabase();
+    await updateUserAtomic(user.id, {
+      name: user.name,
+      username: user.username,
+      email: user.email,
+      password_hash: user.password_hash,
+      updated_at: user.updated_at,
+    });
 
     logAudit({
       userId: user.id,
@@ -678,7 +732,7 @@ superAdminRouter.patch('/my-account', (req: AuthenticatedRequest, res: Response)
       description: `قام المدير العام بتحديث بيانات حسابه الإداري (اسم المستخدم: ${user.username})`,
     });
 
-    const { password_hash, ...safeUser } = user;
+    const safeUser = sanitizeUser(user);
     res.json({
       success: true,
       user: safeUser,
@@ -703,37 +757,37 @@ superAdminRouter.delete('/churches/:id', async (req: AuthenticatedRequest, res: 
 
     const churchName = db.churches[churchIndex].name;
 
-    // 1. Remove church record
-    recordDeletedId(churchId);
-    db.churches.splice(churchIndex, 1);
+    // 1. Remove church record via atomic delete from Firestore
+    await deleteChurchAtomic(churchId);
 
     // 2. Cascade delete all users associated with this church
-    db.users = (db.users || []).filter((u) => u.church_id !== churchId);
+    const churchUsers = (db.users || []).filter((u) => u.church_id === churchId);
+    for (const u of churchUsers) {
+      await deleteUserAtomic(u.id).catch(() => {});
+    }
 
     // 3. Cascade delete all servants
-    db.servants = (db.servants || []).filter((s) => s.church_id !== churchId);
+    const churchServants = (db.servants || []).filter((s) => s.church_id === churchId);
+    for (const s of churchServants) {
+      await deleteServantAtomic(s.id).catch(() => {});
+    }
 
     // 4. Cascade delete all services
-    db.services = (db.services || []).filter((s) => s.church_id !== churchId);
+    const churchServices = (db.services || []).filter((s) => s.church_id === churchId);
+    for (const srvc of churchServices) {
+      await deleteServiceAtomic(srvc.id).catch(() => {});
+    }
 
-    // 5. Cascade delete assignments
+    // 5. In-memory dependent array cleanup
     db.assignments = (db.assignments || []).filter((a) => a.church_id !== churchId);
-
-    // 6. Cascade delete attendance records
     db.attendance = (db.attendance || []).filter((att) => att.church_id !== churchId);
-
-    // 7. Cascade delete general meetings & records
     db.general_meetings = (db.general_meetings || []).filter((m) => m.church_id !== churchId);
     db.general_meeting_records = (db.general_meeting_records || []).filter((r) => r.church_id !== churchId);
-
-    // 8. Cascade delete scanner devices and registration codes
     db.scanner_devices = (db.scanner_devices || []).filter((d) => d.church_id !== churchId);
     db.registration_codes = (db.registration_codes || []).filter((c) => c.church_id !== churchId);
-
-    // 9. Clean up church-specific audit logs
     db.audit_logs = (db.audit_logs || []).filter((l) => l.church_id !== churchId);
 
-    await saveDatabaseAsync();
+    saveLocalDatabaseOnly();
 
     logAudit({
       userId: req.user!.id,
@@ -775,7 +829,7 @@ superAdminRouter.get('/face-id/info', (req: AuthenticatedRequest, res: Response)
 });
 
 // POST /api/super-admin/face-id/enroll - Enroll or update Face ID biometric data
-superAdminRouter.post('/face-id/enroll', (req: AuthenticatedRequest, res: Response) => {
+superAdminRouter.post('/face-id/enroll', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { biometric_vector } = req.body;
     if (!Array.isArray(biometric_vector) || biometric_vector.length < 16) {
@@ -790,10 +844,8 @@ superAdminRouter.post('/face-id/enroll', (req: AuthenticatedRequest, res: Respon
       return;
     }
 
-    superAdmin.face_biometric_data = JSON.stringify(biometric_vector);
-    superAdmin.face_enrolled_at = new Date().toISOString();
-    superAdmin.updated_at = new Date().toISOString();
-    saveDatabase();
+    const enrolledAt = new Date().toISOString();
+    await updateUserFaceAtomic(superAdmin.id, JSON.stringify(biometric_vector), enrolledAt);
 
     logAudit({
       userId: superAdmin.id,
@@ -808,7 +860,7 @@ superAdminRouter.post('/face-id/enroll', (req: AuthenticatedRequest, res: Respon
     res.json({
       success: true,
       message: 'تم تسجيل وتفعيل بصمة الوجه بنجاح! يمكنك الآن تسجيل الدخول بها من صفحة تسجيل الدخول.',
-      enrolled_at: superAdmin.face_enrolled_at,
+      enrolled_at: enrolledAt,
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'فشل حفظ بصمة الوجه' });
@@ -816,7 +868,7 @@ superAdminRouter.post('/face-id/enroll', (req: AuthenticatedRequest, res: Respon
 });
 
 // DELETE /api/super-admin/face-id - Remove Face ID biometric data
-superAdminRouter.delete('/face-id', (req: AuthenticatedRequest, res: Response) => {
+superAdminRouter.delete('/face-id', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const db = getDb();
     const superAdmin = db.users.find((u) => u.id === req.user!.id);
@@ -825,10 +877,7 @@ superAdminRouter.delete('/face-id', (req: AuthenticatedRequest, res: Response) =
       return;
     }
 
-    superAdmin.face_biometric_data = undefined;
-    superAdmin.face_enrolled_at = undefined;
-    superAdmin.updated_at = new Date().toISOString();
-    saveDatabase();
+    await updateUserFaceAtomic(superAdmin.id, undefined, undefined);
 
     logAudit({
       userId: superAdmin.id,

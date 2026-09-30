@@ -1,9 +1,16 @@
 import { Router, Response } from 'express';
 import bcrypt from 'bcryptjs';
-import { getDb, saveDatabase, ensureDatabaseReady } from '../db.js';
-import { generateToken, authenticateJwt, getEffectiveChurchId, getClientIp, AuthenticatedRequest } from '../auth.js';
+import {
+  getDb,
+  ensureDatabaseReady,
+  updateUserLastLogin,
+  updateUserPasswordAtomic,
+  updateUserAtomic,
+} from '../db.js';
+import { generateToken, authenticateJwt, getEffectiveChurchId, getClientIp, AuthenticatedRequest, sanitizeUser } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { sendPasswordResetEmail } from '../mailer.js';
+import { User } from '../../src/types/index.js';
 
 export const authRouter = Router();
 
@@ -97,9 +104,12 @@ authRouter.post('/login', async (req, res) => {
     return;
   }
 
-  // Update last login
-  user.last_login = new Date().toISOString();
-  saveDatabase();
+  // Update last login in an isolated manner (never triggering a full database push)
+  const nowIso = new Date().toISOString();
+  user.last_login = nowIso;
+  updateUserLastLogin(user.id, nowIso).catch((err) => {
+    console.warn('Non-blocking user last_login update error:', err);
+  });
 
   const token = generateToken(user);
 
@@ -114,7 +124,7 @@ authRouter.post('/login', async (req, res) => {
     ipAddress: ip,
   });
 
-  const { password_hash, ...safeUser } = user;
+  const safeUser = sanitizeUser(user);
   const church = user.church_id ? db.churches?.find((c) => c.id === user.church_id) : null;
   res.json({
     success: true,
@@ -131,7 +141,7 @@ authRouter.get('/me', authenticateJwt, (req: AuthenticatedRequest, res: Response
     return;
   }
   const db = getDb();
-  const { password_hash, ...safeUser } = req.user;
+  const safeUser = sanitizeUser(req.user);
   const effectiveChurchId = req.user.church_id || getEffectiveChurchId(req);
   const church = effectiveChurchId ? db.churches?.find((c) => c.id === effectiveChurchId) : null;
   res.json({ user: safeUser, church: church || null });
@@ -155,7 +165,7 @@ authRouter.post('/logout', authenticateJwt, (req: AuthenticatedRequest, res: Res
 });
 
 // Change Password (supports POST and PATCH)
-const handleChangePassword = (req: AuthenticatedRequest, res: Response) => {
+const handleChangePassword = async (req: AuthenticatedRequest, res: Response) => {
   const { current_password, new_password } = req.body;
   const user = req.user!;
 
@@ -177,35 +187,39 @@ const handleChangePassword = (req: AuthenticatedRequest, res: Response) => {
 
   const db = getDb();
   const dbUser = db.users.find((u) => u.id === user.id);
-  if (dbUser) {
-    dbUser.password_hash = bcrypt.hashSync(new_password, 10);
-    dbUser.plain_password_hint = String(new_password).trim();
-    dbUser.must_change_password = false;
-    dbUser.updated_at = new Date().toISOString();
-    saveDatabase();
-
-    logAudit({
-      userId: user.id,
-      username: user.username,
-      action: 'PASSWORD_CHANGE',
-      targetType: 'USER',
-      targetId: user.id,
-      targetName: user.name,
-      description: `قام المستخدم (${user.name}) بتغيير كلمة المرور الخاصة به`,
-      ipAddress: getClientIp(req),
-    });
-
-    res.json({ success: true, message: 'تم تغيير كلمة المرور بنجاح' });
-  } else {
+  if (!dbUser) {
     res.status(404).json({ error: 'المستخدم غير موجود' });
+    return;
   }
+
+  try {
+    const newHash = bcrypt.hashSync(new_password, 10);
+    await updateUserPasswordAtomic(dbUser.id, newHash, String(new_password).trim());
+  } catch (err: any) {
+    console.error('Failed to change password atomically in Firestore:', err);
+    res.status(500).json({ error: 'فشل تغيير كلمة المرور في قاعدة البيانات السحابية' });
+    return;
+  }
+
+  logAudit({
+    userId: user.id,
+    username: user.username,
+    action: 'PASSWORD_CHANGE',
+    targetType: 'USER',
+    targetId: user.id,
+    targetName: user.name,
+    description: `قام المستخدم (${user.name}) بتغيير كلمة المرور الخاصة به`,
+    ipAddress: getClientIp(req),
+  });
+
+  res.json({ success: true, message: 'تم تغيير كلمة المرور بنجاح' });
 };
 
 authRouter.post('/change-password', authenticateJwt, handleChangePassword);
 authRouter.patch('/change-password', authenticateJwt, handleChangePassword);
 
 // Update Profile & Church Role Title
-authRouter.put('/profile', authenticateJwt, (req: AuthenticatedRequest, res: Response) => {
+authRouter.put('/profile', authenticateJwt, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   const { name, church_role_title, role } = req.body;
 
@@ -216,21 +230,30 @@ authRouter.put('/profile', authenticateJwt, (req: AuthenticatedRequest, res: Res
     return;
   }
 
+  const profileUpdates: Partial<User> = {
+    updated_at: new Date().toISOString(),
+  };
+
   if (name && typeof name === 'string' && name.trim()) {
-    dbUser.name = name.trim();
+    profileUpdates.name = name.trim();
   }
 
   if (church_role_title !== undefined) {
     const trimmed = String(church_role_title || '').trim();
-    dbUser.church_role_title = trimmed.length > 0 ? trimmed : undefined;
+    profileUpdates.church_role_title = trimmed.length > 0 ? trimmed : undefined;
   }
 
   if (role && typeof role === 'string') {
-    dbUser.role = role as any;
+    profileUpdates.role = role as any;
   }
 
-  dbUser.updated_at = new Date().toISOString();
-  saveDatabase();
+  try {
+    await updateUserAtomic(dbUser.id, profileUpdates);
+  } catch (err: any) {
+    console.error('Failed to update profile atomically in Firestore:', err);
+    res.status(500).json({ error: 'فشل حفظ تعديل الملف الشخصي في السحابة' });
+    return;
+  }
 
   logAudit({
     userId: user.id,
@@ -243,12 +266,12 @@ authRouter.put('/profile', authenticateJwt, (req: AuthenticatedRequest, res: Res
     ipAddress: getClientIp(req),
   });
 
-  const { password_hash, ...safeUser } = dbUser;
+  const safeUser = sanitizeUser(dbUser);
   res.json({ success: true, user: safeUser });
 });
 
 // Force change password on first login
-authRouter.post('/force-change-password', authenticateJwt, (req: AuthenticatedRequest, res: Response) => {
+authRouter.post('/force-change-password', authenticateJwt, async (req: AuthenticatedRequest, res: Response) => {
   const { new_password } = req.body;
   const user = req.user!;
 
@@ -264,11 +287,14 @@ authRouter.post('/force-change-password', authenticateJwt, (req: AuthenticatedRe
     return;
   }
 
-  dbUser.password_hash = bcrypt.hashSync(new_password, 10);
-  dbUser.plain_password_hint = String(new_password).trim();
-  dbUser.must_change_password = false;
-  dbUser.updated_at = new Date().toISOString();
-  saveDatabase();
+  try {
+    const newHash = bcrypt.hashSync(new_password, 10);
+    await updateUserPasswordAtomic(dbUser.id, newHash, String(new_password).trim());
+  } catch (err: any) {
+    console.error('Failed to force change password atomically in Firestore:', err);
+    res.status(500).json({ error: 'فشل حفظ كلمة المرور الجديدة في السحابة' });
+    return;
+  }
 
   logAudit({
     userId: user.id,
@@ -281,7 +307,7 @@ authRouter.post('/force-change-password', authenticateJwt, (req: AuthenticatedRe
     ipAddress: getClientIp(req),
   });
 
-  const { password_hash, ...safeUser } = dbUser;
+  const safeUser = sanitizeUser(dbUser);
   res.json({
     success: true,
     message: 'تم تعيين كلمة المرور الجديدة بنجاح، مرحباً بك في النظام!',
@@ -370,8 +396,11 @@ authRouter.post('/super-admin/face-id/verify', async (req, res) => {
 
     // Success: Generate session token
     const token = generateToken(superAdmin);
-    superAdmin.last_login = new Date().toISOString();
-    saveDatabase();
+    const nowIso = new Date().toISOString();
+    superAdmin.last_login = nowIso;
+    updateUserLastLogin(superAdmin.id, nowIso).catch((err) => {
+      console.warn('Non-blocking face login last_login update error:', err);
+    });
 
     logAudit({
       userId: superAdmin.id,
@@ -423,7 +452,7 @@ authRouter.post('/super-admin/forgot-password/request', async (req, res) => {
     // Associate email with superAdmin if not previously populated
     if (!superAdmin.email) {
       superAdmin.email = inputEmail;
-      saveDatabase();
+      await updateUserAtomic(superAdmin.id, { email: inputEmail });
     }
 
     // Generate cryptographically random 6-digit OTP
@@ -523,10 +552,8 @@ authRouter.post('/super-admin/forgot-password/reset', async (req, res) => {
 
     // Code is valid! Update password
     const salt = bcrypt.genSaltSync(10);
-    superAdmin.password_hash = bcrypt.hashSync(String(new_password).trim(), salt);
-    superAdmin.must_change_password = false;
-    superAdmin.updated_at = new Date().toISOString();
-    saveDatabase();
+    const newHash = bcrypt.hashSync(String(new_password).trim(), salt);
+    await updateUserPasswordAtomic(superAdmin.id, newHash);
 
     // Clear codes
     recoveryCodes.delete(superAdmin.id);

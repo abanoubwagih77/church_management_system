@@ -21,8 +21,41 @@ export function createExpressApp() {
 
   const app = express();
 
-  // Middlewares
-  app.use(cors());
+  // CORS Configuration: Restrict to trusted production origins and local development
+  const trustedProductionOrigins = new Set([
+    'https://ais-dev-gap63qdklixgujaxjsaf2d-823561301326.europe-west2.run.app',
+    'https://ais-pre-gap63qdklixgujaxjsaf2d-823561301326.europe-west2.run.app',
+    process.env.APP_URL,
+  ].filter(Boolean) as string[]);
+
+  app.use(
+    cors({
+      origin: (origin, callback) => {
+        // Allow requests with no origin (e.g. same-origin navigations, server-side fetch)
+        if (!origin) return callback(null, true);
+
+        // Allow localhost origins in development
+        if (process.env.NODE_ENV !== 'production') {
+          if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+            return callback(null, true);
+          }
+        }
+
+        // Allow explicitly configured trusted origins
+        if (trustedProductionOrigins.has(origin)) {
+          return callback(null, true);
+        }
+
+        // Allow subdomains on Cloud Run for this application deployment
+        if (/^https:\/\/ais-(dev|pre)-[a-z0-9-]+-\d+\.[a-z0-9-]+\.run\.app$/.test(origin)) {
+          return callback(null, true);
+        }
+
+        return callback(new Error('Blocked by CORS policy: Origin not allowed'));
+      },
+      credentials: true,
+    })
+  );
   app.use(express.json({ limit: '25mb' }));
   app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 

@@ -3,7 +3,32 @@ import jwt from 'jsonwebtoken';
 import { getDb } from './db.js';
 import { User, PermissionKey } from '../src/types/index.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'st_george_church_servants_secure_jwt_2026';
+function resolveJwtSecret(): string {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    if (process.env.NODE_ENV === 'production') {
+      console.error('FATAL: JWT_SECRET environment variable is missing in production. Application cannot safely authenticate users.');
+      throw new Error('JWT_SECRET environment variable is required in production.');
+    }
+    // Explicit development-only fallback when running in local dev / testing mode
+    return 'dev_only_church_servants_jwt_secret_do_not_use_in_prod';
+  }
+  return secret;
+}
+
+const JWT_SECRET = resolveJwtSecret();
+
+/**
+ * Strips highly sensitive security and biometric fields before sending user objects to clients.
+ */
+export function sanitizeUser<T extends Partial<User>>(user: T): Omit<T, 'password_hash' | 'face_biometric_data' | 'plain_password_hint' | 'recovery_pin'> {
+  const sanitized = { ...user };
+  delete (sanitized as any).password_hash;
+  delete (sanitized as any).face_biometric_data;
+  delete (sanitized as any).plain_password_hint;
+  delete (sanitized as any).recovery_pin;
+  return sanitized;
+}
 
 export interface AuthenticatedRequest extends Request {
   user?: User;

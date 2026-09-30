@@ -1,6 +1,5 @@
 import { getDb, saveLocalDatabaseOnly } from './db.js';
-import { db as firestoreDb } from './firebase.js';
-import { doc, updateDoc } from 'firebase/firestore';
+import { db as firestoreDb, doc, updateDoc } from './firebase.js';
 import { AuditLog } from '../src/types/index.js';
 
 export interface AuditParams {

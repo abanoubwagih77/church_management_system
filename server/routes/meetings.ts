@@ -1,5 +1,11 @@
 import { Router, Response } from 'express';
-import { getDb, saveDatabase, saveDatabaseAsync, recordDeletedId } from '../db.js';
+import {
+  getDb,
+  createGeneralMeetingAtomic,
+  updateGeneralMeetingAtomic,
+  deleteGeneralMeetingAtomic,
+  saveLocalDatabaseOnly,
+} from '../db.js';
 import { authenticateJwt, requirePermission, getEffectiveChurchId, getClientIp, AuthenticatedRequest } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { GeneralMeeting, GeneralMeetingRecord } from '../../src/types/index.js';
@@ -276,12 +282,7 @@ meetingsRouter.post(
       updated_at: nowIso,
     };
 
-    if (!db.general_meetings) {
-      db.general_meetings = [];
-    }
-
-    db.general_meetings.push(newMeeting);
-    await saveDatabaseAsync();
+    await createGeneralMeetingAtomic(newMeeting);
 
     logAudit({
       userId: user.id,
@@ -330,17 +331,18 @@ meetingsRouter.put(
       status,
     } = req.body;
 
-    if (title) meeting.title = String(title).trim();
-    if (speaker) meeting.speaker = String(speaker).trim();
-    if (date) meeting.date = String(date).trim();
-    if (start_time) meeting.start_time = String(start_time).trim();
-    if (end_time) meeting.end_time = String(end_time).trim();
-    if (late_cutoff_time) meeting.late_cutoff_time = String(late_cutoff_time).trim();
-    if (notes !== undefined) meeting.notes = String(notes).trim();
-    if (status) meeting.status = status;
-    meeting.updated_at = new Date().toISOString();
+    const meetingUpdates: Partial<GeneralMeeting> = {};
+    if (title) meetingUpdates.title = String(title).trim();
+    if (speaker) meetingUpdates.speaker = String(speaker).trim();
+    if (date) meetingUpdates.date = String(date).trim();
+    if (start_time) meetingUpdates.start_time = String(start_time).trim();
+    if (end_time) meetingUpdates.end_time = String(end_time).trim();
+    if (late_cutoff_time) meetingUpdates.late_cutoff_time = String(late_cutoff_time).trim();
+    if (notes !== undefined) meetingUpdates.notes = String(notes).trim();
+    if (status) meetingUpdates.status = status;
+    meetingUpdates.updated_at = new Date().toISOString();
 
-    await saveDatabaseAsync();
+    await updateGeneralMeetingAtomic(id, meetingUpdates);
 
     const churchId = meeting.church_id || getEffectiveChurchId(req);
 
@@ -351,15 +353,16 @@ meetingsRouter.put(
       action: 'MEETING_UPDATED',
       targetType: 'MEETING',
       targetId: meeting.id,
-      targetName: meeting.title,
-      description: `قام (${user.name}) بتعديل تفاصيل اجتماع الخدام: "${meeting.title}"`,
+      targetName: meetingUpdates.title || meeting.title,
+      description: `قام (${user.name}) بتعديل تفاصيل اجتماع الخدام: "${meetingUpdates.title || meeting.title}"`,
       ipAddress: getClientIp(req),
     });
 
+    const updatedMeeting = (db.general_meetings || []).find((m) => m.id === id) || { ...meeting, ...meetingUpdates };
     res.json({
       success: true,
       message: 'تم تعديل بيانات الاجتماع بنجاح',
-      meeting,
+      meeting: updatedMeeting,
     });
   }
 );
@@ -382,15 +385,14 @@ meetingsRouter.delete(
 
     const deleted = db.general_meetings[index];
     const churchId = deleted.church_id || getEffectiveChurchId(req);
-    recordDeletedId(id);
-    db.general_meetings.splice(index, 1);
 
-    // Also remove meeting records or dissociate
+    await deleteGeneralMeetingAtomic(id);
+
+    // Also remove meeting records locally
     db.general_meeting_records = (db.general_meeting_records || []).filter(
       (r) => r.meeting_id !== id
     );
-
-    await saveDatabaseAsync();
+    saveLocalDatabaseOnly();
 
     logAudit({
       userId: user.id,

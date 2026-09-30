@@ -2,15 +2,15 @@ import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import {
   getDb,
-  saveDatabase,
-  saveDatabaseAsync,
   saveLocalDatabaseOnly,
   ensureDatabaseReady,
   runScannerCheckinTransaction,
   recordDeletedId,
+  createScannerDeviceAtomic,
+  updateScannerDeviceAtomic,
+  deleteScannerDeviceAtomic,
 } from '../db.js';
-import { db as firestoreDb } from '../firebase.js';
-import { doc, getDoc, updateDoc } from 'firebase/firestore';
+import { db as firestoreDb, doc, getDoc, updateDoc } from '../firebase.js';
 import { authenticateJwt, requirePermission, getEffectiveChurchId, getClientIp, AuthenticatedRequest } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { ScannerDevice, DeviceRegistrationCode, GeneralMeetingRecord, GeneralMeeting } from '../../src/types/index.js';
@@ -43,7 +43,7 @@ scannerRouter.post(
     };
 
     db.registration_codes.push(regCode);
-    saveDatabase();
+    saveLocalDatabaseOnly();
 
     logAudit({
       userId: user.id,
@@ -126,8 +126,8 @@ scannerRouter.post('/devices/register', async (req: Request, res: Response) => {
   codeRecord.used_at = nowIso;
   codeRecord.used_by_device_name = cleanName;
 
-  db.scanner_devices.push(newDevice);
-  await saveDatabaseAsync();
+  await createScannerDeviceAtomic(newDevice);
+  saveLocalDatabaseOnly();
 
   logAudit({
     username: 'TRUSTED_DEVICE',
@@ -224,7 +224,7 @@ scannerRouter.patch(
   '/devices/:id/toggle',
   authenticateJwt,
   requirePermission('manage_scanner', 'full_access'),
-  (req: AuthenticatedRequest, res: Response) => {
+  async (req: AuthenticatedRequest, res: Response) => {
     const user = req.user!;
     const db = getDb();
     const device = db.scanner_devices.find((d) => d.id === req.params.id);
@@ -234,8 +234,8 @@ scannerRouter.patch(
       return;
     }
 
-    device.is_active = !device.is_active;
-    saveDatabase();
+    const newActiveState = !device.is_active;
+    await updateScannerDeviceAtomic(device.id, { is_active: newActiveState });
 
     logAudit({
       userId: user.id,
@@ -261,7 +261,7 @@ scannerRouter.delete(
   '/devices/:id',
   authenticateJwt,
   requirePermission('manage_scanner', 'full_access'),
-  (req: AuthenticatedRequest, res: Response) => {
+  async (req: AuthenticatedRequest, res: Response) => {
     const user = req.user!;
     const db = getDb();
     const index = db.scanner_devices.findIndex((d) => d.id === req.params.id);
@@ -272,9 +272,7 @@ scannerRouter.delete(
     }
 
     const device = db.scanner_devices[index];
-    recordDeletedId(device.id);
-    db.scanner_devices.splice(index, 1);
-    saveDatabase();
+    await deleteScannerDeviceAtomic(device.id);
 
     logAudit({
       userId: user.id,

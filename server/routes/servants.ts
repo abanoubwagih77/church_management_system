@@ -1,8 +1,16 @@
 import { Router, Response } from 'express';
-import { getDb, saveDatabase, saveDatabaseAsync, recordDeletedId } from '../db.js';
+import {
+  getDb,
+  recordDeletedId,
+  createServantAtomic,
+  updateServantAtomic,
+  updateServantStatusAtomic,
+  transferServantAtomic,
+  deleteServantAtomic,
+} from '../db.js';
 import { authenticateJwt, requirePermission, checkScopeAccess, getEffectiveChurchId, getClientIp, AuthenticatedRequest } from '../auth.js';
 import { logAudit } from '../audit.js';
-import { Servant, ServiceAssignment } from '../../src/types/index.js';
+import { Servant, ServiceAssignment, User } from '../../src/types/index.js';
 
 export const servantsRouter = Router();
 
@@ -103,6 +111,12 @@ servantsRouter.get('/:id', requirePermission('view_servants'), (req: Authenticat
     return;
   }
 
+  // Tenant Isolation: Non-super-admin users can only view servants in their own church
+  if (user.role !== 'super_admin' && servant.church_id && user.church_id && servant.church_id !== user.church_id) {
+    res.status(403).json({ error: 'غير مصرح: لا يمكنك الوصول لبيانات خادم تابع لكنيسة أخرى' });
+    return;
+  }
+
   if (!checkScopeAccess(user, servant.current_service_id)) {
     res.status(403).json({ error: 'ليس لديك صلاحية للوصول لبيانات هذا الخادم في هذه الخدمة' });
     return;
@@ -195,7 +209,7 @@ servantsRouter.post('/', requirePermission('add_servant'), async (req: Authentic
   }
 
   // Check uniqueness
-  const churchId = getEffectiveChurchId(req) || req.body.church_id || user.church_id;
+  const churchId = user.role === 'super_admin' ? (getEffectiveChurchId(req) || req.body.church_id || user.church_id) : user.church_id;
   const exists = db.servants.some((s) => s.national_id === cleanNationalId && (!churchId || s.church_id === churchId));
   if (exists) {
     res.status(400).json({ error: 'يوجد خادم مسجل بالفعل بنفس هذا الرقم القومي في هذه الكنيسة' });
@@ -233,11 +247,10 @@ servantsRouter.post('/', requirePermission('add_servant'), async (req: Authentic
     updated_at: nowIso,
   };
 
-  db.servants.push(newServant);
-
   // If assigned to a service, create an assignment record
+  let assignment: ServiceAssignment | undefined = undefined;
   if (current_service_id) {
-    const assignment: ServiceAssignment = {
+    assignment = {
       id: `assign_${Date.now()}`,
       church_id: churchId || undefined,
       servant_id: newServantId,
@@ -247,10 +260,15 @@ servantsRouter.post('/', requirePermission('add_servant'), async (req: Authentic
       status: 'active',
       created_at: nowIso,
     };
-    db.assignments.push(assignment);
   }
 
-  await saveDatabaseAsync();
+  try {
+    await createServantAtomic(newServant, assignment);
+  } catch (err: any) {
+    console.error('Failed to create servant in Firestore:', err);
+    res.status(500).json({ error: 'فشل حفظ بيانات الخادم في قاعدة البيانات: ' + (err?.message || 'خطأ غير معروف') });
+    return;
+  }
 
   const srvName = db.services.find((s) => s.id === current_service_id)?.name_ar || 'الكنيسة';
 
@@ -289,6 +307,12 @@ servantsRouter.put('/:id', requirePermission('edit_servant'), async (req: Authen
   }
 
   const existing = db.servants[servantIndex];
+
+  // Tenant Isolation: Non-super-admin users can only edit servants in their own church
+  if (user.role !== 'super_admin' && existing.church_id && user.church_id && existing.church_id !== user.church_id) {
+    res.status(403).json({ error: 'غير مصرح: لا يمكنك تعديل بيانات خادم تابع لكنيسة أخرى' });
+    return;
+  }
 
   if (!checkScopeAccess(user, existing.current_service_id)) {
     res.status(403).json({ error: 'ليس لديك صلاحية لتعديل خادم في هذه الخدمة' });
@@ -331,21 +355,23 @@ servantsRouter.put('/:id', requirePermission('edit_servant'), async (req: Authen
     }
   }
 
+  const churchId = existing.church_id || getEffectiveChurchId(req);
   const nowIso = new Date().toISOString();
 
   // Handle service change in assignments history
+  let updatedAssignments: ServiceAssignment[] | undefined = undefined;
   if (current_service_id && current_service_id !== existing.current_service_id) {
-    // End active assignments
-    db.assignments
-      .filter((a) => a.servant_id === existing.id && a.status === 'active')
-      .forEach((a) => {
-        a.status = 'past';
-        a.end_date = nowIso.split('T')[0];
-      });
+    updatedAssignments = db.assignments.map((a) => {
+      if (a.servant_id === existing.id && a.status === 'active') {
+        return { ...a, status: 'past' as const, end_date: nowIso.split('T')[0] };
+      }
+      return a;
+    });
 
     // Create new assignment
-    db.assignments.push({
+    updatedAssignments.push({
       id: `assign_${Date.now()}`,
+      church_id: existing.church_id || churchId || undefined,
       servant_id: existing.id,
       service_id: current_service_id,
       role: current_role || existing.current_role,
@@ -363,25 +389,32 @@ servantsRouter.put('/:id', requirePermission('edit_servant'), async (req: Authen
     service_id: existing.current_service_id,
   };
 
-  existing.full_name = full_name ? full_name.trim() : existing.full_name;
-  existing.date_of_birth = date_of_birth !== undefined ? date_of_birth : existing.date_of_birth;
-  existing.gender = gender ? (gender === 'female' ? 'female' : 'male') : existing.gender;
-  existing.phone = phone ? phone.trim() : existing.phone;
-  existing.email = email !== undefined ? email.trim() : existing.email;
-  existing.address = address !== undefined ? address.trim() : existing.address;
-  if (profile_photo !== undefined) existing.profile_photo = profile_photo;
-  if (id_card_photo !== undefined) existing.id_card_photo = id_card_photo;
-  existing.joining_date = joining_date !== undefined ? joining_date : existing.joining_date;
-  existing.service_start_date = service_start_date !== undefined ? service_start_date : existing.service_start_date;
-  existing.current_service_id = current_service_id !== undefined ? current_service_id : existing.current_service_id;
-  existing.current_role = current_role ? current_role : existing.current_role;
-  existing.status = status ? (status === 'inactive' ? 'inactive' : 'active') : existing.status;
-  existing.notes = notes !== undefined ? notes : existing.notes;
-  existing.updated_at = nowIso;
+  const updatedServant: Servant = {
+    ...existing,
+    full_name: full_name ? full_name.trim() : existing.full_name,
+    date_of_birth: date_of_birth !== undefined ? date_of_birth : existing.date_of_birth,
+    gender: gender ? (gender === 'female' ? 'female' : 'male') : existing.gender,
+    phone: phone ? phone.trim() : existing.phone,
+    email: email !== undefined ? email.trim() : existing.email,
+    address: address !== undefined ? address.trim() : existing.address,
+    profile_photo: profile_photo !== undefined ? profile_photo : existing.profile_photo,
+    id_card_photo: id_card_photo !== undefined ? id_card_photo : existing.id_card_photo,
+    joining_date: joining_date !== undefined ? joining_date : existing.joining_date,
+    service_start_date: service_start_date !== undefined ? service_start_date : existing.service_start_date,
+    current_service_id: current_service_id !== undefined ? current_service_id : existing.current_service_id,
+    current_role: current_role ? current_role : existing.current_role,
+    status: status ? (status === 'inactive' ? 'inactive' : 'active') : existing.status,
+    notes: notes !== undefined ? notes : existing.notes,
+    updated_at: nowIso,
+  };
 
-  await saveDatabaseAsync();
-
-  const churchId = existing.church_id || getEffectiveChurchId(req);
+  try {
+    await updateServantAtomic(updatedServant, updatedAssignments);
+  } catch (err: any) {
+    console.error('Failed to update servant in Firestore:', err);
+    res.status(500).json({ error: 'فشل تحديث بيانات الخادم في قاعدة البيانات: ' + (err?.message || 'خطأ غير معروف') });
+    return;
+  }
 
   logAudit({
     userId: user.id,
@@ -396,16 +429,16 @@ servantsRouter.put('/:id', requirePermission('edit_servant'), async (req: Authen
     changes: {
       before: beforeState,
       after: {
-        full_name: existing.full_name,
-        phone: existing.phone,
-        role: existing.current_role,
-        status: existing.status,
-        service_id: existing.current_service_id,
+        full_name: updatedServant.full_name,
+        phone: updatedServant.phone,
+        role: updatedServant.current_role,
+        status: updatedServant.status,
+        service_id: updatedServant.current_service_id,
       },
     },
   });
 
-  res.json({ success: true, servant: existing });
+  res.json({ success: true, servant: updatedServant });
 });
 
 // PATCH /api/servants/:id/status - Toggle active/inactive
@@ -419,15 +452,28 @@ servantsRouter.patch('/:id/status', requirePermission('edit_servant'), async (re
     return;
   }
 
+  // Tenant Isolation: Non-super-admin users can only modify servants in their own church
+  if (user.role !== 'super_admin' && servant.church_id && user.church_id && servant.church_id !== user.church_id) {
+    res.status(403).json({ error: 'غير مصرح: لا يمكنك تعديل حالة خادم تابع لكنيسة أخرى' });
+    return;
+  }
+
   if (!checkScopeAccess(user, servant.current_service_id)) {
     res.status(403).json({ error: 'ليس لديك صلاحية لتعديل حالة هذا الخادم' });
     return;
   }
 
   const prevStatus = servant.status;
-  servant.status = servant.status === 'active' ? 'inactive' : 'active';
-  servant.updated_at = new Date().toISOString();
-  await saveDatabaseAsync();
+  const newStatus = servant.status === 'active' ? 'inactive' : 'active';
+  const updatedAt = new Date().toISOString();
+
+  try {
+    await updateServantStatusAtomic(servant.id, newStatus, updatedAt);
+  } catch (err: any) {
+    console.error('Failed to update servant status in Firestore:', err);
+    res.status(500).json({ error: 'فشل تحديث حالة الخادم في قاعدة البيانات: ' + (err?.message || 'خطأ غير معروف') });
+    return;
+  }
 
   const churchId = servant.church_id || getEffectiveChurchId(req);
 
@@ -439,11 +485,11 @@ servantsRouter.patch('/:id/status', requirePermission('edit_servant'), async (re
     targetType: 'SERVANT',
     targetId: servant.id,
     targetName: servant.full_name,
-    description: `قام المستخدم (${user.name}) بتغيير حالة الخادم (${servant.full_name}) من (${prevStatus}) إلى (${servant.status})`,
+    description: `قام المستخدم (${user.name}) بتغيير حالة الخادم (${servant.full_name}) من (${prevStatus}) إلى (${newStatus})`,
     ipAddress: getClientIp(req),
   });
 
-  res.json({ success: true, status: servant.status });
+  res.json({ success: true, status: newStatus });
 });
 
 // DELETE /api/servants/:id - Delete servant
@@ -459,6 +505,12 @@ servantsRouter.delete('/:id', requirePermission('delete_servant'), async (req: A
 
   const servant = db.servants[index];
 
+  // Tenant Isolation: Non-super-admin users can only delete servants in their own church
+  if (user.role !== 'super_admin' && servant.church_id && user.church_id && servant.church_id !== user.church_id) {
+    res.status(403).json({ error: 'غير مصرح: لا يمكنك حذف خادم تابع لكنيسة أخرى' });
+    return;
+  }
+
   if (!checkScopeAccess(user, servant.current_service_id)) {
     res.status(403).json({ error: 'ليس لديك صلاحية لحذف هذا الخادم' });
     return;
@@ -466,14 +518,13 @@ servantsRouter.delete('/:id', requirePermission('delete_servant'), async (req: A
 
   const churchId = servant.church_id || getEffectiveChurchId(req);
 
-  // Remove servant
-  recordDeletedId(servant.id);
-  db.servants.splice(index, 1);
-  // Also clean up their assignments & attendance
-  db.assignments = db.assignments.filter((a) => a.servant_id !== servant.id);
-  db.attendance = db.attendance.filter((a) => a.servant_id !== servant.id);
-
-  await saveDatabaseAsync();
+  try {
+    await deleteServantAtomic(servant.id);
+  } catch (err: any) {
+    console.error('Failed to delete servant in Firestore:', err);
+    res.status(500).json({ error: 'فشل حذف الخادم من قاعدة البيانات: ' + (err?.message || 'خطأ غير معروف') });
+    return;
+  }
 
   logAudit({
     userId: user.id,
@@ -498,6 +549,12 @@ servantsRouter.get('/:id/id-card', requirePermission('view_servant_details'), (r
 
   if (!servant) {
     res.status(404).json({ error: 'الخادم غير موجود' });
+    return;
+  }
+
+  // Tenant Isolation: Non-super-admin users can only view ID cards of servants in their own church
+  if (user.role !== 'super_admin' && servant.church_id && user.church_id && servant.church_id !== user.church_id) {
+    res.status(403).json({ error: 'غير مصرح: لا يمكنك عرض بطاقة خادم تابع لكنيسة أخرى' });
     return;
   }
 
@@ -530,13 +587,19 @@ servantsRouter.get('/:id/id-card', requirePermission('view_servant_details'), (r
 });
 
 // POST /api/servants/:id/transfer - Transfer servant to new service/stage for new Coptic year
-servantsRouter.post('/:id/transfer', requirePermission('edit_servant'), (req: AuthenticatedRequest, res: Response) => {
+servantsRouter.post('/:id/transfer', requirePermission('edit_servant'), async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   const db = getDb();
   const servant = db.servants.find((s) => s.id === req.params.id);
 
   if (!servant) {
     res.status(404).json({ error: 'الخادم غير موجود' });
+    return;
+  }
+
+  // Tenant Isolation: Non-super-admin users can only transfer servants in their own church
+  if (user.role !== 'super_admin' && servant.church_id && user.church_id && servant.church_id !== user.church_id) {
+    res.status(403).json({ error: 'غير مصرح: لا يمكنك نقل خادم تابع لكنيسة أخرى' });
     return;
   }
 
@@ -555,21 +618,28 @@ servantsRouter.post('/:id/transfer', requirePermission('edit_servant'), (req: Au
     return;
   }
 
+  // Prevent transferring to a service belonging to another church
+  if (user.role !== 'super_admin' && newService.church_id && user.church_id && newService.church_id !== user.church_id) {
+    res.status(403).json({ error: 'غير مصرح: لا يمكنك نقل الخادم إلى خدمة تابعة لكنيسة أخرى' });
+    return;
+  }
+
   const nowIso = new Date().toISOString();
   const transferStartDate = start_date || nowIso.split('T')[0];
 
   // 1. Mark current active assignment as past
-  db.assignments.forEach((a) => {
+  const updatedAssignments: ServiceAssignment[] = db.assignments.map((a) => {
     if (a.servant_id === servant.id && a.status === 'active') {
-      a.status = 'past';
-      a.end_date = transferStartDate;
+      return { ...a, status: 'past' as const, end_date: transferStartDate };
     }
+    return { ...a };
   });
 
   // 2. Create new assignment
   const roleName = new_role ? String(new_role).trim() : servant.current_role;
   const newAssignment: ServiceAssignment = {
     id: `asgn_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    church_id: servant.church_id || undefined,
     servant_id: servant.id,
     service_id: new_service_id,
     role: roleName,
@@ -579,23 +649,41 @@ servantsRouter.post('/:id/transfer', requirePermission('edit_servant'), (req: Au
     notes: notes || undefined,
     created_at: nowIso,
   };
-  db.assignments.push(newAssignment);
+  updatedAssignments.push(newAssignment);
 
   // 3. Update servant's current stage and role
   const prevServiceId = servant.current_service_id;
   const prevRole = servant.current_role;
-  servant.current_service_id = new_service_id;
-  servant.current_role = roleName;
-  servant.updated_at = nowIso;
+  const updatedServant: Servant = {
+    ...servant,
+    current_service_id: new_service_id,
+    current_role: roleName,
+    updated_at: nowIso,
+  };
 
   // 4. If this servant has a linked user account with role 'stage_coordinator', update scope automatically
-  const linkedUser = db.users.find((u) => u.linked_servant_id === servant.id);
-  if (linkedUser && linkedUser.role === 'stage_coordinator') {
-    linkedUser.scope = new_service_id;
-    linkedUser.updated_at = nowIso;
+  const rawLinkedUser = db.users.find((u) => u.linked_servant_id === servant.id);
+  let linkedUser: User | undefined = undefined;
+  if (rawLinkedUser && rawLinkedUser.role === 'stage_coordinator') {
+    linkedUser = {
+      ...rawLinkedUser,
+      scope: new_service_id,
+      updated_at: nowIso,
+    };
   }
 
-  saveDatabase();
+  try {
+    await transferServantAtomic({
+      servant: updatedServant,
+      newAssignment,
+      updatedAssignments,
+      linkedUser,
+    });
+  } catch (err: any) {
+    console.error('Failed to transfer servant in Firestore:', err);
+    res.status(500).json({ error: 'فشل نقل الخادم في قاعدة البيانات: ' + (err?.message || 'خطأ غير معروف') });
+    return;
+  }
 
   logAudit({
     userId: user.id,
@@ -615,18 +703,25 @@ servantsRouter.post('/:id/transfer', requirePermission('edit_servant'), (req: Au
   res.json({
     success: true,
     message: `تم نقل الخادم إلى (${newService.name_ar}) وحفظ السجل في تاريخ الخدمة بنجاح`,
-    servant,
+    servant: updatedServant,
     assignment: newAssignment,
   });
 });
 
 // GET /api/servants/:id/history - Get complete multi-year service history
 servantsRouter.get('/:id/history', requirePermission('view_servants'), (req: AuthenticatedRequest, res: Response) => {
+  const user = req.user!;
   const db = getDb();
   const servant = db.servants.find((s) => s.id === req.params.id);
 
   if (!servant) {
     res.status(404).json({ error: 'الخادم غير موجود' });
+    return;
+  }
+
+  // Tenant Isolation: Non-super-admin users can only view history of servants in their own church
+  if (user.role !== 'super_admin' && servant.church_id && user.church_id && servant.church_id !== user.church_id) {
+    res.status(403).json({ error: 'غير مصرح: لا يمكنك عرض سجل خادم تابع لكنيسة أخرى' });
     return;
   }
 

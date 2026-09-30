@@ -57,16 +57,15 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Connection test as required by skill instructions
-async function testConnection() {
+// Connection test helper (kept inactive on client to prevent unnecessary direct browser reads)
+export async function testConnection() {
   try {
     await getDocFromServer(doc(db, 'system', 'connection'));
   } catch (error) {
     if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration or network status.');
+      console.warn('Firebase network status notice.');
     }
   }
 }
-testConnection();
 
 export default app;

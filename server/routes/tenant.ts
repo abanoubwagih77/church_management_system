@@ -1,7 +1,8 @@
 import { Router, Response } from 'express';
-import { getDb, saveDatabase } from '../db.js';
+import { getDb, updateChurchAtomic } from '../db.js';
 import { authenticateJwt, getEffectiveChurchId, AuthenticatedRequest } from '../auth.js';
 import { logAudit } from '../audit.js';
+import { Church } from '../../src/types/index.js';
 
 export const tenantRouter = Router();
 
@@ -111,7 +112,7 @@ tenantRouter.get('/settings', authenticateJwt, (req: AuthenticatedRequest, res: 
 });
 
 // POST /api/tenant/acknowledge-renewal-notice - Acknowledge renewal notice by church
-tenantRouter.post('/acknowledge-renewal-notice', authenticateJwt, (req: AuthenticatedRequest, res: Response) => {
+tenantRouter.post('/acknowledge-renewal-notice', authenticateJwt, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const churchId = getEffectiveChurchId(req);
     if (!churchId) {
@@ -127,9 +128,18 @@ tenantRouter.post('/acknowledge-renewal-notice', authenticateJwt, (req: Authenti
     }
 
     if (church.subscription?.renewal_notice) {
-      church.subscription.renewal_notice.acknowledged = true;
-      church.updated_at = new Date().toISOString();
-      saveDatabase();
+      const updatedNotice = {
+        ...church.subscription.renewal_notice,
+        acknowledged: true,
+      };
+      const updatedSubscription = {
+        ...church.subscription,
+        renewal_notice: updatedNotice,
+      };
+      await updateChurchAtomic(church.id, {
+        subscription: updatedSubscription,
+        updated_at: new Date().toISOString(),
+      });
     }
 
     res.json({ success: true, message: 'تم تأكيد قراءة إشعار التجديد' });
@@ -139,7 +149,7 @@ tenantRouter.post('/acknowledge-renewal-notice', authenticateJwt, (req: Authenti
 });
 
 // PUT /api/tenant/settings - Update church branding & details (Church Admin, Priest or Super Admin)
-tenantRouter.put('/settings', authenticateJwt, (req: AuthenticatedRequest, res: Response) => {
+tenantRouter.put('/settings', authenticateJwt, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const user = req.user!;
     const churchId = getEffectiveChurchId(req);
@@ -180,47 +190,46 @@ tenantRouter.put('/settings', authenticateJwt, (req: AuthenticatedRequest, res: 
       branding,
     } = req.body || {};
 
-    if (name) church.name = name.trim();
-    if (diocese !== undefined) church.diocese = diocese.trim();
-    if (bishop_name !== undefined) church.bishop_name = bishop_name.trim();
-    if (address !== undefined) church.address = address.trim();
-    if (phone !== undefined) church.phone = phone.trim();
-    if (email !== undefined) church.email = email.trim();
-    if (verse !== undefined) church.verse = verse.trim();
+    const churchUpdates: Partial<Church> = {};
+    if (name) churchUpdates.name = name.trim();
+    if (diocese !== undefined) churchUpdates.diocese = diocese.trim();
+    if (bishop_name !== undefined) churchUpdates.bishop_name = bishop_name.trim();
+    if (address !== undefined) churchUpdates.address = address.trim();
+    if (phone !== undefined) churchUpdates.phone = phone.trim();
+    if (email !== undefined) churchUpdates.email = email.trim();
+    if (verse !== undefined) churchUpdates.verse = verse.trim();
 
-    // Handle logo from top-level or branding
+    const currentBranding = church.branding ? { ...church.branding } : {};
     const effectiveLogo = logo_url !== undefined ? logo_url : branding?.logo_url;
     if (effectiveLogo !== undefined) {
-      church.logo_url = effectiveLogo;
-      if (!church.branding) church.branding = {};
-      church.branding.logo_url = effectiveLogo;
+      churchUpdates.logo_url = effectiveLogo;
+      currentBranding.logo_url = effectiveLogo;
     }
 
-    // Handle social links
     const effectiveSocial = social_links || branding?.social_links;
     if (effectiveSocial !== undefined) {
-      church.social_links = {
+      const mergedSocial = {
         ...(church.social_links || {}),
         ...effectiveSocial,
       };
-      if (!church.branding) church.branding = {};
-      church.branding.social_links = {
-        ...(church.branding.social_links || {}),
-        ...effectiveSocial,
-      };
+      churchUpdates.social_links = mergedSocial;
+      currentBranding.social_links = mergedSocial;
     }
 
     if (branding?.primary_color) {
-      if (!church.branding) church.branding = {};
-      church.branding.primary_color = branding.primary_color;
+      currentBranding.primary_color = branding.primary_color;
     }
     if (branding?.secondary_color) {
-      if (!church.branding) church.branding = {};
-      church.branding.secondary_color = branding.secondary_color;
+      currentBranding.secondary_color = branding.secondary_color;
     }
 
-    church.updated_at = new Date().toISOString();
-    saveDatabase();
+    if (Object.keys(currentBranding).length > 0) {
+      churchUpdates.branding = currentBranding;
+    }
+
+    const nowIso = new Date().toISOString();
+    churchUpdates.updated_at = nowIso;
+    await updateChurchAtomic(church.id, churchUpdates);
 
     logAudit({
       userId: user.id,
@@ -232,9 +241,10 @@ tenantRouter.put('/settings', authenticateJwt, (req: AuthenticatedRequest, res: 
       description: `قام (${user.name}) بتحديث هوية وإعدادات الكنيسة (${church.name})`,
     });
 
+    const updatedChurch = db.churches?.find((c) => c.id === churchId) || church;
     res.json({
       success: true,
-      church,
+      church: updatedChurch,
       message: 'تم حفظ إعدادات وهوية الكنيسة بنجاح',
     });
   } catch (error: any) {

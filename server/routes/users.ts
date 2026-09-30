@@ -1,7 +1,14 @@
 import { Router, Response } from 'express';
 import bcrypt from 'bcryptjs';
-import { getDb, saveDatabase, recordDeletedId } from '../db.js';
-import { authenticateJwt, requirePermission, getEffectiveChurchId, getClientIp, AuthenticatedRequest } from '../auth.js';
+import {
+  getDb,
+  createUserAtomic,
+  updateUserAtomic,
+  deleteUserAtomic,
+  updateUserPasswordAtomic,
+  bulkCreateUsersAtomic,
+} from '../db.js';
+import { authenticateJwt, requirePermission, getEffectiveChurchId, getClientIp, AuthenticatedRequest, sanitizeUser } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { User, RoleType, PermissionKey } from '../../src/types/index.js';
 
@@ -162,12 +169,12 @@ usersRouter.get('/', requirePermission('view_users'), (req: AuthenticatedRequest
   }
 
   const safeUsers = userList.map((u) => {
-    const { password_hash, ...rest } = u;
+    const cleanUser = sanitizeUser(u);
     const linkedServant = u.linked_servant_id ? db.servants.find((s) => s.id === u.linked_servant_id) : undefined;
     const scopeService = u.scope !== 'all' ? db.services.find((s) => s.id === u.scope) : undefined;
 
     return {
-      ...rest,
+      ...cleanUser,
       linked_servant_name: linkedServant ? linkedServant.full_name : undefined,
       scope_service_name: scopeService ? scopeService.name_ar : 'كافة الخدمات (شامل)',
     };
@@ -177,7 +184,7 @@ usersRouter.get('/', requirePermission('view_users'), (req: AuthenticatedRequest
 });
 
 // POST /api/users - Create user
-usersRouter.post('/', requirePermission('add_user'), (req: AuthenticatedRequest, res: Response) => {
+usersRouter.post('/', requirePermission('add_user'), async (req: AuthenticatedRequest, res: Response) => {
   const currentUser = req.user!;
   const db = getDb();
   const churchId = getEffectiveChurchId(req);
@@ -228,8 +235,13 @@ usersRouter.post('/', requirePermission('add_user'), (req: AuthenticatedRequest,
     password_hash: bcrypt.hashSync(password, 10),
   };
 
-  db.users.push(newUser);
-  saveDatabase();
+  try {
+    await createUserAtomic(newUser);
+  } catch (err: any) {
+    console.error('Failed to create user atomically in Firestore:', err);
+    res.status(500).json({ error: 'فشل حفظ المستخدم في قاعدة البيانات السحابية' });
+    return;
+  }
 
   logAudit({
     userId: currentUser.id,
@@ -249,12 +261,12 @@ usersRouter.post('/', requirePermission('add_user'), (req: AuthenticatedRequest,
     },
   });
 
-  const { password_hash, ...safeUser } = newUser;
+  const safeUser = sanitizeUser(newUser);
   res.status(201).json({ success: true, user: safeUser });
 });
 
 // PUT /api/users/:id - Update user
-usersRouter.put('/:id', requirePermission('edit_user'), (req: AuthenticatedRequest, res: Response) => {
+usersRouter.put('/:id', requirePermission('edit_user'), async (req: AuthenticatedRequest, res: Response) => {
   const currentUser = req.user!;
   const db = getDb();
   const targetUser = db.users.find((u) => u.id === req.params.id);
@@ -276,27 +288,36 @@ usersRouter.put('/:id', requirePermission('edit_user'), (req: AuthenticatedReque
   const prevPermissions = [...targetUser.permissions];
   const prevStatus = targetUser.status;
 
-  if (name) targetUser.name = name.trim();
-  if (role) targetUser.role = role as RoleType;
+  const updatePayload: Partial<User> = {
+    updated_at: new Date().toISOString(),
+  };
+
+  if (name) updatePayload.name = name.trim();
+  if (role) updatePayload.role = role as RoleType;
   if (church_role_title !== undefined) {
     const trimmed = String(church_role_title || '').trim();
-    targetUser.church_role_title = trimmed.length > 0 ? trimmed : undefined;
+    updatePayload.church_role_title = trimmed.length > 0 ? trimmed : undefined;
   }
-  if (scope !== undefined) targetUser.scope = scope;
-  if (linked_servant_id !== undefined) targetUser.linked_servant_id = linked_servant_id || undefined;
-  if (status) targetUser.status = status;
+  if (scope !== undefined) updatePayload.scope = scope;
+  if (linked_servant_id !== undefined) updatePayload.linked_servant_id = linked_servant_id || undefined;
+  if (status) updatePayload.status = status;
 
   let permissionsChanged = false;
   if (Array.isArray(permissions)) {
     // Check if changed
     if (JSON.stringify(permissions.sort()) !== JSON.stringify(prevPermissions.sort())) {
       permissionsChanged = true;
-      targetUser.permissions = permissions;
+      updatePayload.permissions = permissions;
     }
   }
 
-  targetUser.updated_at = new Date().toISOString();
-  saveDatabase();
+  try {
+    await updateUserAtomic(targetUser.id, updatePayload);
+  } catch (err: any) {
+    console.error('Failed to update user atomically in Firestore:', err);
+    res.status(500).json({ error: 'فشل تحديث بيانات المستخدم في قاعدة البيانات السحابية' });
+    return;
+  }
 
   if (permissionsChanged) {
     logAudit({
@@ -339,12 +360,12 @@ usersRouter.put('/:id', requirePermission('edit_user'), (req: AuthenticatedReque
     ipAddress: getClientIp(req),
   });
 
-  const { password_hash, ...safeUser } = targetUser;
+  const safeUser = sanitizeUser(targetUser);
   res.json({ success: true, user: safeUser });
 });
 
 // PATCH /api/users/:id/reset-password
-usersRouter.patch('/:id/reset-password', requirePermission('edit_user'), (req: AuthenticatedRequest, res: Response) => {
+usersRouter.patch('/:id/reset-password', requirePermission('edit_user'), async (req: AuthenticatedRequest, res: Response) => {
   const currentUser = req.user!;
   const db = getDb();
   const targetUser = db.users.find((u) => u.id === req.params.id);
@@ -360,9 +381,14 @@ usersRouter.patch('/:id/reset-password', requirePermission('edit_user'), (req: A
     return;
   }
 
-  targetUser.password_hash = bcrypt.hashSync(new_password, 10);
-  targetUser.updated_at = new Date().toISOString();
-  saveDatabase();
+  try {
+    const newHash = bcrypt.hashSync(new_password, 10);
+    await updateUserPasswordAtomic(targetUser.id, newHash);
+  } catch (err: any) {
+    console.error('Failed to reset user password atomically in Firestore:', err);
+    res.status(500).json({ error: 'فشل إعادة تعيين كلمة المرور في قاعدة البيانات السحابية' });
+    return;
+  }
 
   logAudit({
     userId: currentUser.id,
@@ -379,7 +405,7 @@ usersRouter.patch('/:id/reset-password', requirePermission('edit_user'), (req: A
 });
 
 // DELETE /api/users/:id
-usersRouter.delete('/:id', requirePermission('delete_user'), (req: AuthenticatedRequest, res: Response) => {
+usersRouter.delete('/:id', requirePermission('delete_user'), async (req: AuthenticatedRequest, res: Response) => {
   const currentUser = req.user!;
   const db = getDb();
 
@@ -388,13 +414,11 @@ usersRouter.delete('/:id', requirePermission('delete_user'), (req: Authenticated
     return;
   }
 
-  const index = db.users.findIndex((u) => u.id === req.params.id);
-  if (index === -1) {
+  const targetUser = db.users.find((u) => u.id === req.params.id);
+  if (!targetUser) {
     res.status(404).json({ error: 'المستخدم غير موجود' });
     return;
   }
-
-  const targetUser = db.users[index];
 
   // Prevent deleting if it would leave the system without any Priest or Super Admin
   const hasOtherAdmin = db.users.some(
@@ -408,9 +432,13 @@ usersRouter.delete('/:id', requirePermission('delete_user'), (req: Authenticated
     return;
   }
 
-  recordDeletedId(targetUser.id);
-  db.users.splice(index, 1);
-  saveDatabase();
+  try {
+    await deleteUserAtomic(targetUser.id);
+  } catch (err: any) {
+    console.error('Failed to delete user atomically in Firestore:', err);
+    res.status(500).json({ error: 'فشل حذف المستخدم من قاعدة البيانات السحابية' });
+    return;
+  }
 
   logAudit({
     userId: currentUser.id,
@@ -427,7 +455,7 @@ usersRouter.delete('/:id', requirePermission('delete_user'), (req: Authenticated
 });
 
 // POST /api/users/bulk-generate - Generate accounts for servants in bulk
-usersRouter.post('/bulk-generate', requirePermission('add_user'), (req: AuthenticatedRequest, res: Response) => {
+usersRouter.post('/bulk-generate', requirePermission('add_user'), async (req: AuthenticatedRequest, res: Response) => {
   const currentUser = req.user!;
   const db = getDb();
   const { service_id, default_password_type, custom_password } = req.body;
@@ -461,6 +489,7 @@ usersRouter.post('/bulk-generate', requirePermission('add_user'), (req: Authenti
     phone: string;
   }[] = [];
 
+  const newUsersToPersist: User[] = [];
   const nowIso = new Date().toISOString();
 
   for (const servant of servantsWithoutUsers) {
@@ -469,7 +498,10 @@ usersRouter.post('/bulk-generate', requirePermission('add_user'), (req: Authenti
     let baseUsername = `servant_${phoneTail}`;
     let candidateUsername = baseUsername;
     let counter = 1;
-    while (db.users.some((u) => u.username.toLowerCase() === candidateUsername.toLowerCase())) {
+    while (
+      db.users.some((u) => u.username.toLowerCase() === candidateUsername.toLowerCase()) ||
+      newUsersToPersist.some((u) => u.username.toLowerCase() === candidateUsername.toLowerCase())
+    ) {
       candidateUsername = `${baseUsername}_${counter}`;
       counter++;
     }
@@ -501,7 +533,7 @@ usersRouter.post('/bulk-generate', requirePermission('add_user'), (req: Authenti
       password_hash: bcrypt.hashSync(initialPassword, 10),
     };
 
-    db.users.push(newUser);
+    newUsersToPersist.push(newUser);
 
     const srv = db.services.find((s) => s.id === servant.current_service_id);
     generatedUsers.push({
@@ -514,7 +546,13 @@ usersRouter.post('/bulk-generate', requirePermission('add_user'), (req: Authenti
     });
   }
 
-  saveDatabase();
+  try {
+    await bulkCreateUsersAtomic(newUsersToPersist);
+  } catch (err: any) {
+    console.error('Failed to atomically bulk create users in Firestore:', err);
+    res.status(500).json({ error: 'فشل حفظ حسابات الخدام في السحابة.' });
+    return;
+  }
 
   logAudit({
     userId: currentUser.id,
