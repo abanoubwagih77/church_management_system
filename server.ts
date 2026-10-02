@@ -5,7 +5,7 @@ import { createExpressApp } from './server/app.js';
 
 async function startServer() {
   const app = createExpressApp();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   // Vite Middleware in Dev vs Static in Production
   if (process.env.NODE_ENV !== 'production') {
